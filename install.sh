@@ -16,7 +16,7 @@ sleep 5
 #Instala Bind
 apt-get update
 apt-get upgrade
-apt install bind9 bind9-utils
+apt install bind9 bind9-utils -y
 sleep 5
 
 #Configurar DNS Recursivo
