@@ -25,6 +25,12 @@ rm named.conf.options
 wget https://raw.githubusercontent.com/viejojavi/dns/main/named.conf.options
 sleep 5
 
+#Colocar bind9 como resolver
+rm /etc/resolv.conf
+cd /etc/
+wget https://raw.githubusercontent.com/viejojavi/dns/refs/heads/main/resolv.conf
+sleep 5
+
 #Verificar configuracion
 named-checkconf
 echo "Configurarcion Correcta"
