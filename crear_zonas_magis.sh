@@ -1,6 +1,6 @@
 #!/bin/bash
 
-url_github="https://raw.githubusercontent.com/viejojavi/dns/main/magis.txt"
+url_github="38.188.178.250/magis/magis.txt"
 archivo_urls="urls_bloqueadas_magis.txt"
 archivo_configuracion="/etc/bind/named.conf.local"
 directorio_zonas="/etc/bind/zones"
