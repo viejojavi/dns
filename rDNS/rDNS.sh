@@ -133,12 +133,16 @@ for sub in "${!ptr_registros[@]}"; do
 
 done
 
-# 8. Reiniciar BIND
+# 8. Asignar permisos al usuario bind
+chown -R bind:bind /etc/bind/zones
+chmod -R 770 /etc/bind/zones
+
+# 9. Reiniciar BIND
 systemctl restart bind9
 
-# 9. Verificar estado
+# 10. Verificar estado
 systemctl status bind9
 
-# 10. Probar resolución inversa
+# 11. Probar resolución inversa
 read -rp "Ingrese una IP del rango autorizado para verificar con dig: " test_ip
 dig -x "$test_ip"
