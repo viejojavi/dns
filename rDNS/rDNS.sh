@@ -5,9 +5,9 @@
 set -e
 
 # 1. Solicitar datos
-read -rp "Ingrese el dominio de la empresa (ej. ticcol.com): " dominio
+read -rp "Ingrese el dominio de la empresa (ej. ejemplo.com): " dominio
 read -rp "Ingrese el nombre del servidor DNS (ej. ns2): " nombre_dns
-read -rp "Ingrese el correo del administrador (ej. admin@ticcol.com): " email
+read -rp "Ingrese el correo del administrador (ej. admin@ejemplo.com): " email
 read -rp "Ingrese la IP IPv4 asignada: " ipv4
 read -rp "Ingrese el rango IPv6 asignado por LACNIC: " ipv6_rango
 
@@ -47,7 +47,7 @@ archivo_zona_directa="/etc/bind/zones/$dns_fqdn"
 archivo_zona_reversa="/etc/bind/zones/rango_ip.reverse"
 
 # 2. Instalar BIND
-apt update && apt install -y bind9 bind9utils bind9-doc
+apt update && apt install -y bind9 bind9utils bind9-doc apparmor-utils
 
 # 3. Configurar named.conf.options
 cat <<EOF > /etc/bind/named.conf.options
@@ -130,19 +130,32 @@ for sub in "${!ptr_registros[@]}"; do
     octets=$(echo "$ip" | awk -F. '{print $4"."$3"."$2"."$1}')
     echo "$octets.in-addr.arpa. IN PTR $sub.$dominio." >> "$archivo_zona_reversa"
   fi
-
-done
+  done
 
 # 8. Asignar permisos al usuario bind
 chown -R bind:bind /etc/bind/zones
 chmod -R 770 /etc/bind/zones
 
-# 9. Reiniciar BIND
+# 9. Verificar y ajustar AppArmor si es necesario
+if aa-status | grep -q "/usr/sbin/named"; then
+  echo "AppArmor está habilitado para named. Cambiando a modo complain..."
+  aa-complain /usr/sbin/named
+fi
+
+# 10. Reiniciar BIND
 systemctl restart bind9
 
-# 10. Verificar estado
+# 11. Verificar estado
 systemctl status bind9
 
-# 11. Probar resolución inversa
+# 12. Validar que los archivos fueron creados correctamente
+echo "\nVerificando archivos de zona..."
+if [[ -s "$archivo_zona_directa" && -s "$archivo_zona_reversa" ]]; then
+  echo "Archivos de zona generados correctamente."
+else
+  echo "Error: Uno o ambos archivos de zona están vacíos o no existen."
+fi
+
+# 13. Probar resolución inversa
 read -rp "Ingrese una IP del rango autorizado para verificar con dig: " test_ip
 dig -x "$test_ip"
