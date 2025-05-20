@@ -1,239 +1,128 @@
 #!/bin/bash
 
-### CONFIGURACIÓN INICIAL ###
-SCRIPT_DIR="$(dirname "$(realpath "$0")")"
-ZONES_DIR="/etc/bind/zones"
-CONF_DIR="/etc/bind/zones-config"
-LISTAS=(
-  "$SCRIPT_DIR/coljuegos.txt"
-  "$SCRIPT_DIR/mintic.txt"
-  "$SCRIPT_DIR/magis.txt"
-)
-FORWARDERS="8.8.8.8; 1.1.1.1;"
-IPV4_REDIRECT="38.188.178.250"
-IPV6_REDIRECT="2803:b850:0:200::250"
-LOG_FILE="/var/log/dns_manager.log"
-TOTAL_DOMINIOS=0
-DOMINIOS_VALIDOS=0
-DOMINIOS_INVALIDOS=0
-ZONAS_NUEVAS=0
-ZONAS_EXISTENTES=0
+# Configuración
+ZONAS_DIR="/etc/bind/zones"
+LOG_DIR="/var/log/dns_manager"
+LOGO_DIR="/var/www/html/logos"
+REVERSE_CONF_V4="$ZONAS_DIR/db.38.188.178.250"
+REVERSE_CONF_V6="$ZONAS_DIR/db.2803.b850.0.200"
+IPV4_REDIR="38.188.178.250"
+IPV6_REDIR="2803:b850:0:200::250"
+DNS_TARGET="redireccion.blocked.local."
 
-### VERIFICAR DEPENDENCIAS ###
-dependencias=(bind9 dnsutils curl)
-for pkg in "${dependencias[@]}"; do
-  dpkg -s "$pkg" &>/dev/null || apt-get install -y "$pkg"
-done
-
-### FUNCIONES ###
-generar_serial() {
-  date +"%Y%U%H%M"
-}
-
-validar_dominio() {
-  local dominio="$1"
-  [[ "$dominio" =~ ^([a-zA-Z0-9][-a-zA-Z0-9]*\.)+[a-zA-Z]{2,}$ ]]
-}
-
-crear_zona_directa() {
-  local dominio="$1"
-  local zone_file="$ZONES_DIR/db.${dominio//\//_}"
-  local serial=$(generar_serial)
-
-  local contenido=$(cat << EOF
-$TTL    86400
-@       IN      SOA     ns1.ticcol.com. admin.ticcol.com. (
-                          $serial ; Serial
-                          3600       ; Refresh
-                          1800       ; Retry
-                          1209600    ; Expire
-                          86400 )    ; Negative Cache TTL
-;
-@       IN      NS      ns1.ticcol.com.
-@       IN      A       $IPV4_REDIRECT
-@       IN      AAAA    $IPV6_REDIRECT
-www     IN      A       $IPV4_REDIRECT
-www     IN      AAAA    $IPV6_REDIRECT
-EOF
-)
-
-  if [[ -f "$zone_file" ]] && cmp -s <(echo "$contenido") "$zone_file"; then
-    ((ZONAS_EXISTENTES++))
-    echo "$(date) - Zona $dominio ya existe y no ha cambiado. Se omite." >> "$LOG_FILE"
-  else
-    echo "$contenido" > "$zone_file"
-    ((ZONAS_NUEVAS++))
-    echo "Zona directa creada/actualizada: $dominio"
-  fi
-}
-
-crear_config_zona() {
-  local dominio="$1"
-  local conf_file="$CONF_DIR/${dominio//\//_}.conf"
-
-  local contenido=$(cat << EOF
-zone "$dominio" {
-  type master;
-  file "$ZONES_DIR/db.${dominio//\//_}";
-  allow-query { any; };
-};
-EOF
-)
-
-  if [[ -f "$conf_file" ]] && cmp -s <(echo "$contenido") "$conf_file"; then
-    echo "$(date) - Config $dominio sin cambios. Se omite." >> "$LOG_FILE"
-  else
-    echo "$contenido" > "$conf_file"
-    echo "Configuración de zona agregada/actualizada: $dominio"
-  fi
-}
-
-crear_zona_inversa() {
-  local ip="$1"
-  local es_ipv6="$2"
-  local zona
-  local archivo
-  local serial=$(generar_serial)
-
-  if [[ "$es_ipv6" == "true" ]]; then
-    zona=$(echo "$ip" | awk -F: '{for(i=1;i<=NF;i++) printf "%04x", strtonum("0x"$i)}' | grep -o . | tac | paste -sd . - | sed 's/\.$//').ip6.arpa
-    archivo="$ZONES_DIR/db.${zona//./_}"
-  else
-    zona=$(echo "$ip" | awk -F. '{print $3"."$2"."$1".in-addr.arpa"}')
-    archivo="$ZONES_DIR/db.${zona//./_}"
-  fi
-
-  [[ -f "$archivo" ]] && return
-
-  local ptr
-  if [[ "$es_ipv6" == "true" ]]; then
-    ptr=$(echo "$ip" | awk -F: '{for(i=1;i<=NF;i++) printf "%04x", strtonum("0x"$i)}' | grep -o . | tac | head -n 64 | paste -sd .)
-    ptr_line="$ptr IN PTR bloqueados.ticcol.com."
-  else
-    ptr=$(echo "$ip" | awk -F. '{print $4}')
-    ptr_line="$ptr IN PTR bloqueados.ticcol.com."
-  fi
-
-  cat > "$archivo" << EOF
-$TTL    86400
-@       IN      SOA     ns1.ticcol.com. admin.ticcol.com. (
-                          $serial ; Serial
-                          3600       ; Refresh
-                          1800       ; Retry
-                          1209600    ; Expire
-                          86400 )    ; Negative Cache TTL
-;
-@       IN      NS      ns1.ticcol.com.
-$ptr_line
-EOF
-
-  local conf_file="$CONF_DIR/${zona//./_}.conf"
-  cat > "$conf_file" << EOF
-zone "$zona" {
-  type master;
-  file "$archivo";
-  allow-query { any; };
-};
-EOF
-
-  echo "Zona inversa creada: $zona"
-}
-
-agregar_zonas_al_named_conf() {
-  local named_local="/etc/bind/named.conf.local"
-  echo -e "// Zonas administradas automáticamente\n" > "$named_local"
-  for f in "$CONF_DIR"/*.conf; do
-    echo "include \"$f\";" >> "$named_local"
-  done
-
-  cat > /etc/bind/named.conf.options << EOF
-options {
-  directory "/var/cache/bind";
-
-  forwarders {
-    $FORWARDERS
-  };
-
-  allow-recursion { any; };
-  recursion yes;
-  dnssec-validation auto;
-  auth-nxdomain no;
-  listen-on { any; };
-  listen-on-v6 { any; };
-};
-EOF
-
-  echo "Configuración general aplicada."
-}
-
-procesar_lista() {
-  local lista="$1"
-  [[ -f "$lista" ]] || return
-
-  mapfile -t dominios < <(grep -v '^[[:space:]]*$' "$lista" | sed 's|https\?://||' | cut -d'/' -f1 | tr -d '\r' | sort -u)
-  local total=${#dominios[@]}
-  ((TOTAL_DOMINIOS+=total))
-  local count=0
-
-  for dominio in "${dominios[@]}"; do
-    ((count++))
-    local percent=$((count * 100 / total))
-    echo -ne "\rProcesando $dominio ($count/$total) [$percent%]"
-    if validar_dominio "$dominio"; then
-      ((DOMINIOS_VALIDOS++))
-      crear_zona_directa "$dominio"
-      crear_config_zona "$dominio"
-    else
-      ((DOMINIOS_INVALIDOS++))
-      echo "$(date) - Dominio inválido: $dominio" >> "$LOG_FILE"
+# Requisitos
+verificar_dependencias() {
+  echo "[+] Verificando dependencias..."
+  for pkg in idn2 python3; do
+    if ! command -v $pkg &> /dev/null; then
+      echo "[-] Instalando $pkg..."
+      apt-get update -qq && apt-get install -y -qq $pkg
     fi
   done
-  echo -e "\nLista procesada: $lista"
 }
 
-validar_bind() {
-  named-checkconf || return 1
-  for z in "$ZONES_DIR"/db.*; do
-    local base="$(basename "$z")"
-    local d="${base#db.}"
-    named-checkzone "$d" "$z" || return 1
+# Validación de dominio incluyendo punycode y TLDs nuevos
+validar_dominio() {
+  dominio="$1"
+  dominio_ascii=$(idn2 "$dominio" 2>/dev/null)
+  [[ -z "$dominio_ascii" ]] && return 1
+  [[ "$dominio_ascii" =~ ^([a-zA-Z0-9-]{1,63}\.)+[a-zA-Z]{2,}$ ]] && return 0 || return 1
+}
+
+# Crear zona directa para un dominio
+crear_zona_directa() {
+  dominio="$1"
+  archivo="$ZONAS_DIR/db.$dominio"
+  cat > "$archivo" <<EOF
+\$TTL 86400
+@   IN  SOA ns1.$dominio. admin.$dominio. (
+        $(date +%Y%m%d%H)
+        3600
+        1800
+        604800
+        86400 )
+;
+@       IN  NS      ns1.$dominio.
+@       IN  A       $IPV4_REDIR
+@       IN  AAAA    $IPV6_REDIR
+www     IN  CNAME   @
+EOF
+}
+
+# Crear zona inversa para IPv4
+crear_zona_inversa_ipv4() {
+  cat > "$REVERSE_CONF_V4" <<EOF
+\$TTL 86400
+@   IN  SOA ns1.blocked.local. admin.blocked.local. (
+        $(date +%Y%m%d%H)
+        3600
+        1800
+        604800
+        86400 )
+;
+@   IN  NS ns1.blocked.local.
+250 IN PTR $DNS_TARGET.
+EOF
+}
+
+# Crear zona inversa para IPv6 (simplificada con $ORIGIN)
+crear_zona_inversa_ipv6() {
+  cat > "$REVERSE_CONF_V6" <<EOF
+\$TTL 86400
+@   IN  SOA ns1.blocked.local. admin.blocked.local. (
+        $(date +%Y%m%d%H)
+        3600
+        1800
+        604800
+        86400 )
+;
+@   IN  NS ns1.blocked.local.
+
+\$ORIGIN 0.0.0.0.0.0.0.0.0.2.0.0.0.0.5.8.b.3.0.8.2.ip6.arpa.
+0.5.2 IN PTR $DNS_TARGET.
+EOF
+}
+
+# Procesar lista de dominios
+procesar_lista() {
+  lista="$1"
+  echo "[+] Procesando lista: $lista"
+  while IFS= read -r linea || [[ -n "$linea" ]]; do
+    # Extraer dominio según tipo de archivo
+    if [[ "$lista" == "mintic.txt" ]]; then
+      dominio=$(echo "$linea" | sed -E 's|https?://||;s|/.*||;s|^www\.||')
+    else
+      dominio=$(echo "$linea" | grep -oP '(https?://)?\K[^/]+')
+    fi
+
+    validar_dominio "$dominio"
+    if [[ $? -eq 0 ]]; then
+      echo "✓ Dominio válido: $dominio"
+      crear_zona_directa "$dominio"
+    else
+      echo "✗ Dominio inválido: $linea"
+    fi
+  done < "$lista"
+}
+
+# Crear estructura inicial
+preparar_estructura() {
+  mkdir -p "$ZONAS_DIR" "$LOG_DIR" "$LOGO_DIR"
+}
+
+# Main
+main() {
+  verificar_dependencias
+  preparar_estructura
+
+  crear_zona_inversa_ipv4
+  crear_zona_inversa_ipv6
+
+  for archivo in coljuegos.txt mintic.txt magis.txt; do
+    [[ -f "$archivo" ]] && procesar_lista "$archivo"
   done
-  return 0
+
+  echo "[✔] Proceso finalizado."
 }
 
-reiniciar_bind() {
-  if validar_bind; then
-    systemctl reload bind9 && echo "Bind recargado con éxito." >> "$LOG_FILE"
-    echo "Bind recargado exitosamente."
-  else
-    echo "Error en configuración BIND. Verifica named-checkconf y named-checkzone." | tee -a "$LOG_FILE"
-  fi
-}
-
-### EJECUCIÓN PRINCIPAL ###
-mkdir -p "$ZONES_DIR" "$CONF_DIR"
-echo "$(date) - Inicio de ejecución" >> "$LOG_FILE"
-
-for lista in "${LISTAS[@]}"; do
-  if [[ -f "$lista" ]]; then
-    procesar_lista "$lista"
-  else
-    echo "$(date) - Advertencia: Lista no encontrada: $lista" >> "$LOG_FILE"
-  fi
-  echo "Finalizó procesamiento de lista: $lista"
-done
-
-crear_zona_inversa "$IPV4_REDIRECT" false
-crear_zona_inversa "$IPV6_REDIRECT" true
-
-agregar_zonas_al_named_conf
-reiniciar_bind
-
-echo "$(date) - Fin de ejecución" >> "$LOG_FILE"
-echo -e "\nResumen Final:"
-echo "  Total dominios procesados: $TOTAL_DOMINIOS"
-echo "  Dominios válidos configurados: $DOMINIOS_VALIDOS"
-echo "  Dominios inválidos u omitidos: $DOMINIOS_INVALIDOS"
-echo "  Zonas nuevas creadas: $ZONAS_NUEVAS"
-echo "  Zonas ya existentes sin cambios: $ZONAS_EXISTENTES"
-echo -e "\nProceso completado. Verifica $LOG_FILE para más detalles."
+main "$@"
