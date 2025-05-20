@@ -73,6 +73,7 @@ function create_zone_entry() {
 }
 
 function generate_ptr_zones() {
+  mkdir -p "$ZONES_DIR"
   local ptr_file_v4="$ZONES_DIR/ptr_v4.zone"
   local ptr_file_v6="$ZONES_DIR/ptr_v6.zone"
   local ip4_zone="250.178.188.38.in-addr.arpa"
@@ -123,15 +124,26 @@ function process_list() {
   local total=0 valid=0 invalid=0
   local omit_file="$LOG_DIR/omitidos_$list_name.txt"
   echo "" > "$omit_file"
-
   mapfile -t lines < "$list"
   total=${#lines[@]}
   echo "🔁 Procesando $total dominios de $list_name..."
+
   for i in "${!lines[@]}"; do
     line="${lines[$i]}"
-    domain=$(extract_domain "$line")
+
+    # Extraer dominio en caso de URL completa
+    if [[ "$line" =~ ^https?:// ]]; then
+      domain=$(extract_domain "$line")
+    else
+      domain="$line"
+    fi
+
     idn_domain=$(idn2 "$domain" 2>/dev/null)
     if is_valid_domain "$idn_domain"; then
+      if [[ ${SEEN_DOMAINS["$idn_domain"]} ]]; then
+        continue
+      fi
+      SEEN_DOMAINS["$idn_domain"]=1
       zone_file="$temp_zone/db.$idn_domain"
       generate_zone_file "$idn_domain" "$zone_file"
       create_zone_entry "$idn_domain" "$zone_file"
@@ -157,7 +169,6 @@ function summary_report() {
   echo -e "\n📊 RESUMEN FINAL"
   for file in "$LOG_DIR"/omitidos_*.txt; do
     list_name=$(basename "$file" | cut -d_ -f2 | cut -d. -f1)
-    total=$(wc -l < "$1")
     valid=$(find "$ZONES_DIR/zones_$list_name" -type f | wc -l)
     omitidos=$(wc -l < "$file")
     echo -e "🗂 Lista: $list_name | ✅ Válidos: $valid | ❌ Omitidos: $omitidos"
@@ -165,6 +176,7 @@ function summary_report() {
 }
 
 ### EJECUCIÓN ###
+declare -A SEEN_DOMAINS
 check_dependencies
 download_lists
 process_list "$COLJUEGOS" "coljuegos"
