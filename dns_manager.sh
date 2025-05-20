@@ -83,11 +83,18 @@ crear_zona_inversa_ipv6() {
 EOF
 }
 
-# Procesar lista de dominios
+# Procesar lista de dominios con barra de progreso
 procesar_lista() {
   lista="$1"
   echo "[+] Procesando lista: $lista"
+
+  total=$(grep -cve '^\s*$' "$lista")
+  count=0
+
   while IFS= read -r linea || [[ -n "$linea" ]]; do
+    ((count++))
+    porcentaje=$((count * 100 / total))
+
     # Extraer dominio según tipo de archivo
     if [[ "$lista" == "mintic.txt" ]]; then
       dominio=$(echo "$linea" | sed -E 's|https?://||;s|/.*||;s|^www\.||')
@@ -95,14 +102,13 @@ procesar_lista() {
       dominio=$(echo "$linea" | grep -oP '(https?://)?\K[^/]+')
     fi
 
-    validar_dominio "$dominio"
-    if [[ $? -eq 0 ]]; then
-      echo "✓ Dominio válido: $dominio"
+    if validar_dominio "$dominio"; then
       crear_zona_directa "$dominio"
-    else
-      echo "✗ Dominio inválido: $linea"
     fi
+
+    printf "\r[+] Progreso: %3d%%" "$porcentaje"
   done < "$lista"
+  echo
 }
 
 # Crear estructura inicial
