@@ -1,181 +1,179 @@
 #!/bin/bash
 
-# Configuración
-ZONAS_DIR="/etc/bind/zones"
+### CONFIGURACIÓN GLOBAL ###
+IPV4_REDIRECT="38.188.178.250"
+IPV6_REDIRECT="2803:b850:0:200::250"
+PTR_DOMAIN="bloqueo.cirtedns.local."
+ZONES_DIR="/etc/bind/zones"
 LOG_DIR="/var/log/dns_manager"
-LOGO_DIR="/var/www/html/logos"
-OMITIDOS_LOG="$LOG_DIR/omitidos.log"
-REVERSE_CONF_V4="$ZONAS_DIR/db.38.188.178.250"
-REVERSE_CONF_V6="$ZONAS_DIR/db.2803.b850.0.200"
-IPV4_REDIR="38.188.178.250"
-IPV6_REDIR="2803:b850:0:200::250"
-DNS_TARGET="redireccion.blocked.local."
+LOGO_DIR="/var/www/logos"
+NAMED_LOCAL="/etc/bind/named.conf.local"
+
+### ARCHIVOS DE LISTAS ###
+COLJUEGOS="coljuegos.txt"
+MINTIC="mintic.txt"
 MAGIS_URL="https://raw.githubusercontent.com/viejojavi/dns/refs/heads/main/magis.txt"
-MAGIS_LOCAL="magis.txt"
+MAGIS="magis.txt"
 
-# Estadísticas
-DOMINIOS_TOTAL=0
-DOMINIOS_VALIDOS=0
-DOMINIOS_INVALIDOS=0
-ZONAS_CREADAS=0
-ZONAS_ACTUALIZADAS=0
-ZONAS_ELIMINADAS=0
+### FUNCIONES ###
 
-# Colores
-VERDE="\e[32m"
-ROJO="\e[31m"
-AZUL="\e[34m"
-AMARILLO="\e[33m"
-RESET="\e[0m"
-
-verificar_dependencias() {
-  echo "[+] Verificando dependencias..."
-  for pkg in idn2 python3 curl; do
-    if ! command -v $pkg &>/dev/null; then
-      echo "[-] Instalando $pkg..."
-      apt-get update -qq && apt-get install -y -qq $pkg
+function check_dependencies() {
+  echo "🔍 Verificando dependencias..."
+  for pkg in bind9 idn2 python3; do
+    if ! dpkg -s "$pkg" &>/dev/null; then
+      echo "🛠 Instalando $pkg..."
+      apt-get install -y "$pkg"
     fi
+  done
+  mkdir -p "$ZONES_DIR" "$LOG_DIR" "$LOGO_DIR"
+}
+
+function download_lists() {
+  echo "⬇️  Descargando listas..."
+  curl -s "$MAGIS_URL" -o "$MAGIS"
+}
+
+function extract_domain() {
+  local url="$1"
+  echo "$url" | sed -E 's#https?://([^/]+).*#\1#' | sed 's/^www\.//' | tr '[:upper:]' '[:lower:]'
+}
+
+function is_valid_domain() {
+  local domain="$1"
+  echo "$domain" | grep -Pq "^(?!-)[a-z0-9]+([-.]{1,2}[a-z0-9]+)*\.[a-z]{2,}$"
+}
+
+function generate_zone_file() {
+  local domain="$1"
+  local zone_file="$2"
+  cat > "$zone_file" <<EOF
+\$TTL 1H
+@   IN  SOA ns1.cirtedns.local. admin.cirtedns.local. (
+          $(date +%Y%m%d%H) ; Serial
+          1H ; Refresh
+          15M ; Retry
+          1W ; Expire
+          1D ) ; Minimum TTL
+
+    IN  NS  ns1.cirtedns.local.
+    IN  A   $IPV4_REDIRECT
+    IN  AAAA $IPV6_REDIRECT
+www IN  A   $IPV4_REDIRECT
+www IN  AAAA $IPV6_REDIRECT
+EOF
+}
+
+function create_zone_entry() {
+  local domain="$1"
+  local zone_file="$2"
+  echo "zone \"$domain\" {
+  type master;
+  file \"$zone_file\";
+};" > "$ZONES_DIR/conf_$domain.zone"
+}
+
+function generate_ptr_zones() {
+  local ptr_file_v4="$ZONES_DIR/ptr_v4.zone"
+  local ptr_file_v6="$ZONES_DIR/ptr_v6.zone"
+  local ip4_zone="250.178.188.38.in-addr.arpa"
+  local ip6_zone="0.5.2.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.3.8.0.2.ip6.arpa"
+
+  cat > "$ptr_file_v4" <<EOF
+\$TTL 1H
+@   IN  SOA ns1.cirtedns.local. admin.cirtedns.local. (
+          $(date +%Y%m%d%H) ; Serial
+          1H ; Refresh
+          15M ; Retry
+          1W ; Expire
+          1D ) ; Minimum TTL
+
+    IN  NS  ns1.cirtedns.local.
+250 IN  PTR $PTR_DOMAIN
+EOF
+
+  cat > "$ptr_file_v6" <<EOF
+\$TTL 1H
+@   IN  SOA ns1.cirtedns.local. admin.cirtedns.local. (
+          $(date +%Y%m%d%H) ; Serial
+          1H ; Refresh
+          15M ; Retry
+          1W ; Expire
+          1D ) ; Minimum TTL
+
+    IN  NS  ns1.cirtedns.local.
+250.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.3.8.0.2 IN PTR $PTR_DOMAIN
+EOF
+
+  echo "zone \"$ip4_zone\" {
+  type master;
+  file \"$ptr_file_v4\";
+};" > "$ZONES_DIR/conf_ptr_v4.zone"
+
+  echo "zone \"$ip6_zone\" {
+  type master;
+  file \"$ptr_file_v6\";
+};" > "$ZONES_DIR/conf_ptr_v6.zone"
+}
+
+function process_list() {
+  local list="$1"
+  local list_name="$2"
+  local temp_zone="$ZONES_DIR/zones_$list_name"
+  mkdir -p "$temp_zone"
+  local total=0 valid=0 invalid=0
+  local omit_file="$LOG_DIR/omitidos_$list_name.txt"
+  echo "" > "$omit_file"
+
+  mapfile -t lines < "$list"
+  total=${#lines[@]}
+  echo "🔁 Procesando $total dominios de $list_name..."
+  for i in "${!lines[@]}"; do
+    line="${lines[$i]}"
+    domain=$(extract_domain "$line")
+    idn_domain=$(idn2 "$domain" 2>/dev/null)
+    if is_valid_domain "$idn_domain"; then
+      zone_file="$temp_zone/db.$idn_domain"
+      generate_zone_file "$idn_domain" "$zone_file"
+      create_zone_entry "$idn_domain" "$zone_file"
+      ((valid++))
+    else
+      echo "$domain" >> "$omit_file"
+      ((invalid++))
+    fi
+    percent=$(( (i+1) * 100 / total ))
+    echo -ne "\r🚧 Progreso: $percent%"
+  done
+  echo -e "\n✅ $valid dominios válidos, ❌ $invalid omitidos."
+}
+
+function update_named_conf() {
+  echo "// Archivo original preservado" > "$NAMED_LOCAL"
+  for f in "$ZONES_DIR"/conf_*.zone; do
+    echo "include \"$f\";" >> "$NAMED_LOCAL"
   done
 }
 
-validar_dominio() {
-  dominio="$1"
-  dominio_ascii=$(idn2 "$dominio" 2>/dev/null)
-  [[ -z "$dominio_ascii" ]] && return 1
-  [[ "$dominio_ascii" =~ ^([a-zA-Z0-9-]{1,63}\.)+[a-zA-Z]{2,}$ ]] && return 0 || return 1
+function summary_report() {
+  echo -e "\n📊 RESUMEN FINAL"
+  for file in "$LOG_DIR"/omitidos_*.txt; do
+    list_name=$(basename "$file" | cut -d_ -f2 | cut -d. -f1)
+    total=$(wc -l < "$1")
+    valid=$(find "$ZONES_DIR/zones_$list_name" -type f | wc -l)
+    omitidos=$(wc -l < "$file")
+    echo -e "🗂 Lista: $list_name | ✅ Válidos: $valid | ❌ Omitidos: $omitidos"
+  done
 }
 
-crear_zona_directa() {
-  dominio="$1"
-  archivo="$ZONAS_DIR/db.$dominio"
+### EJECUCIÓN ###
+check_dependencies
+download_lists
+process_list "$COLJUEGOS" "coljuegos"
+process_list "$MINTIC" "mintic"
+process_list "$MAGIS" "magis"
+generate_ptr_zones
+update_named_conf
+summary_report
 
-  if [[ -f "$archivo" ]]; then
-    ZONAS_ACTUALIZADAS=$((ZONAS_ACTUALIZADAS + 1))
-  else
-    ZONAS_CREADAS=$((ZONAS_CREADAS + 1))
-  fi
+systemctl reload bind9
 
-  cat >"$archivo" <<EOF
-\$TTL 86400
-@   IN  SOA ns1.$dominio. admin.$dominio. (
-        $(date +%Y%m%d%H)
-        3600
-        1800
-        604800
-        86400 )
-;
-@       IN  NS      ns1.$dominio.
-@       IN  A       $IPV4_REDIR
-@       IN  AAAA    $IPV6_REDIR
-www     IN  CNAME   @
-EOF
-}
-
-crear_zona_inversa_ipv4() {
-  cat >"$REVERSE_CONF_V4" <<EOF
-\$TTL 86400
-@   IN  SOA ns1.blocked.local. admin.blocked.local. (
-        $(date +%Y%m%d%H)
-        3600
-        1800
-        604800
-        86400 )
-;
-@   IN  NS ns1.blocked.local.
-250 IN PTR $DNS_TARGET.
-EOF
-}
-
-crear_zona_inversa_ipv6() {
-  cat >"$REVERSE_CONF_V6" <<EOF
-\$TTL 86400
-@   IN  SOA ns1.blocked.local. admin.blocked.local. (
-        $(date +%Y%m%d%H)
-        3600
-        1800
-        604800
-        86400 )
-;
-@   IN  NS ns1.blocked.local.
-
-\$ORIGIN 0.0.0.0.0.0.0.0.0.2.0.0.0.0.5.8.b.3.0.8.2.ip6.arpa.
-0.5.2 IN PTR $DNS_TARGET.
-EOF
-}
-
-procesar_lista() {
-  lista="$1"
-  echo "[+] Procesando lista: $lista"
-
-  total=$(grep -cve '^\s*$' "$lista")
-  count=0
-
-  while IFS= read -r linea || [[ -n "$linea" ]]; do
-    ((count++))
-    porcentaje=$((count * 100 / total))
-
-    if [[ "$lista" == "mintic.txt" ]]; then
-      dominio=$(echo "$linea" | sed -E 's|https?://||;s|/.*||;s|^www\.||')
-    else
-      dominio=$(echo "$linea" | grep -oP '(https?://)?\K[^/]+')
-    fi
-
-    dominio=${dominio,,} # a minúsculas
-    ((DOMINIOS_TOTAL++))
-
-    if validar_dominio "$dominio"; then
-      crear_zona_directa "$dominio"
-      ((DOMINIOS_VALIDOS++))
-    else
-      echo "$dominio" >> "$OMITIDOS_LOG"
-      ((DOMINIOS_INVALIDOS++))
-    fi
-
-    printf "\r[+] Progreso: %3d%%" "$porcentaje"
-  done <"$lista"
-  echo
-}
-
-descargar_magis() {
-  echo "[+] Descargando magis.txt desde GitHub..."
-  curl -s -o "$MAGIS_LOCAL" "$MAGIS_URL"
-  if [[ ! -s "$MAGIS_LOCAL" ]]; then
-    echo "[-] Error al descargar magis.txt"
-    exit 1
-  fi
-}
-
-preparar_estructura() {
-  mkdir -p "$ZONAS_DIR" "$LOG_DIR" "$LOGO_DIR"
-  > "$OMITIDOS_LOG"  # Limpiar log de omitidos
-}
-
-resumen_final() {
-  echo -e "\n${AZUL}========= RESUMEN DE OPERACIÓN =========${RESET}"
-  echo -e "${AMARILLO}Dominios totales:     ${DOMINIOS_TOTAL}${RESET}"
-  echo -e "${VERDE}Dominios válidos:     ${DOMINIOS_VALIDOS}${RESET}"
-  echo -e "${ROJO}Dominios omitidos:    ${DOMINIOS_INVALIDOS}${RESET}"
-  echo -e "${VERDE}Zonas creadas:        ${ZONAS_CREADAS}${RESET}"
-  echo -e "${AZUL}Zonas actualizadas:   ${ZONAS_ACTUALIZADAS}${RESET}"
-  echo -e "${ROJO}Zonas eliminadas:     ${ZONAS_ELIMINADAS}${RESET}"  # No eliminamos en esta versión
-  echo -e "${AZUL}=========================================${RESET}"
-  echo -e "${AMARILLO}Omitidos guardados en:${RESET} $OMITIDOS_LOG"
-}
-
-main() {
-  verificar_dependencias
-  preparar_estructura
-
-  crear_zona_inversa_ipv4
-  crear_zona_inversa_ipv6
-
-  [[ -f "coljuegos.txt" ]] && procesar_lista "coljuegos.txt"
-  [[ -f "mintic.txt" ]] && procesar_lista "mintic.txt"
-
-  descargar_magis
-  procesar_lista "$MAGIS_LOCAL"
-
-  resumen_final
-}
-
-main "$@"
+exit 0
