@@ -1,0 +1,71 @@
+#!/bin/bash
+
+# Configuración de variables
+USUARIO="xxx"
+CONTRASENA="xxxx"
+URL_MINTIC="https://bloqueo.ticcol.com/archivos/mintic.txt"
+URL_COLJUEGOS="https://bloqueo.ticcol.com/archivos/coljuegos.txt"
+ARCHIVO_MINTIC="mintic.txt"
+ARCHIVO_COLJUEGOS="coljuegos.txt"
+ARCHIVO_DOMINIOS="dominios_mintic.txt"
+ARCHIVO_PATHS="paths_dominios.txt"
+LOG_FILE="/var/log/descarga_dominios.log"
+
+# Función para registrar logs
+log() {
+  echo "$(date) - $1" >> "$LOG_FILE"
+}
+
+# Descargar archivos
+descargar_archivos() {
+  log "Iniciando descarga de archivos."
+  wget --user="$USUARIO" --password="$CONTRASENA" "$URL_MINTIC" -O "$ARCHIVO_MINTIC"
+  if [ $? -ne 0 ]; then
+    log "Error al descargar $ARCHIVO_MINTIC."
+    return 1
+  fi
+  wget --user="$USUARIO" --password="$CONTRASENA" "$URL_COLJUEGOS" -O "$ARCHIVO_COLJUEGOS"
+  if [ $? -ne 0 ]; then
+    log "Error al descargar $ARCHIVO_COLJUEGOS."
+    return 1
+  fi
+  log "Descarga de archivos completada."
+  return 0
+}
+
+# Extraer dominios y paths de mintic.txt
+extraer_dominios_paths() {
+  log "Iniciando extracción de dominios y paths de $ARCHIVO_MINTIC."
+  declare -A dominios_paths # Diccionario asociativo para dominios y paths
+  while IFS= read -r url; do
+    if [[ "$url" =~ ^(https?:\/\/)?([a-zA-Z0-9.-]+\.[a-zA-Z]{2,})(.*) ]]; then
+      dominio="${BASH_REMATCH[2]}"
+      path="${BASH_REMATCH[3]}"
+      if [[ -z "$path" ]]; then
+        path="/" # Si no hay path, establecerlo como "/"
+      fi
+      dominios_paths["$dominio"]+="$path\n" # Agregar path al diccionario
+    fi
+  done < "$ARCHIVO_MINTIC"
+
+  # Escribir dominios y paths en archivo ordenado
+  for dominio in "${!dominios_paths[@]}"; do
+    echo "$dominio:${dominios_paths[$dominio]}"
+  done | sort > "$ARCHIVO_PATHS"
+
+  if [ $? -ne 0 ]; then
+    log "Error al extraer dominios y paths."
+    return 1
+  fi
+  log "Extracción de dominios y paths completada. Dominios y paths guardados en $ARCHIVO_PATHS."
+  return 0
+}
+
+# Ejecutar funciones
+descargar_archivos
+if [ $? -eq 0 ]; then
+  extraer_dominios_paths
+fi
+
+# Fin del script
+log "Script finalizado."
