@@ -1,7 +1,7 @@
 Para bloqueo :
 dns
-curl -sSf https://raw.githubusercontent.com/viejojavi/dns/refs/heads/main/crear_zonas_magis.sh | sh
-Para rDNS https://raw.githubusercontent.com/viejojavi/dns/refs/heads/main/asistente_dns.tar.gz
+debes instalar el archivo descarga_mintic.sh y el archivo dns_manager.sh
+
 
 rDNS:
 sudo dpkg -i bind-rdns-asistente_1.0.0.deb
