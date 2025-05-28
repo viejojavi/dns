@@ -207,7 +207,7 @@ zone "178.188.38.in-addr.arpa" {
 };
 
 // Zona inversa para ${IPV6_ADDRESS}
-zone "0.0.0.0.0.0.0.0.0.0.0.0.0.2.0.0.0.0.0.5.8.b.3.0.8.2.ip6.arpa" {
+zone "0.5.2.0.0.0.0.2.0.0.5.8.b.3.0.8.2.ip6.arpa" {
     type master;
     file "${ZONE_DIR}/db.2803b8500200";
 };
