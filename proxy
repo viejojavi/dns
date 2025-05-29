@@ -1,0 +1,1964 @@
+#!/bin/bash
+
+set -e
+
+## Configuración inicial
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+LOG_FILE="/var/log/dominios_bloqueados.log"
+exec > >(tee -a "$LOG_FILE") 2>&1
+
+## Colores para la salida
+GREEN="\e[32m"
+RED="\e[31m"
+YELLOW="\e[33m"
+BLUE="\e[34m"
+RESET="\e[0m"
+
+## Archivos y directorios
+COLJUEGOS="$SCRIPT_DIR/coljuegos.txt"
+MINTIC="$SCRIPT_DIR/mintic.txt"
+MAGIS_URL="https://raw.githubusercontent.com/viejojavi/dns/refs/heads/main/magis.txt"
+MAGIS="$SCRIPT_DIR/magis.txt"
+SITES_AVAILABLE="/etc/apache2/sites-available"
+SITES_ENABLED="/etc/apache2/sites-enabled"
+BLOQUEO_DIR="/var/www/bloqueo"
+BLOQUEO_HTML="$BLOQUEO_DIR/index.php"
+REPORTE_HTML="$BLOQUEO_DIR/reporte.html"
+LOGOS_CONF="$SCRIPT_DIR/logos.conf"
+BLOCKED_DIR="/etc/apache2/blocked_lists"
+BLOCKED_DOMAINS_ORIGIN="$BLOCKED_DIR/blocked_domains_origin.txt"
+BLOCKED_URLS_LIST="$BLOCKED_DIR/blocked_urls_list.txt"
+DEFAULT_LOGO="logo.png"
+APACHE_CONF="000-blocked-sites.conf"
+LOGOS_DIR="$BLOQUEO_DIR/logos"
+
+## Función para mostrar mensaje de error y salir
+error_exit() {
+    echo -e "${RED}[ERROR] $1${RESET}" >&2
+    exit 1
+}
+
+## Función mejorada para verificar dependencias
+verify_dependencies() {
+    echo -e "${BLUE}Verificando dependencias...${RESET}"
+    
+    local DEPENDENCIES=(apache2 curl certbot)
+    local MISSING_DEPS=()
+    local PKG_INSTALLED=0
+
+    # Verificar comandos básicos
+    for cmd in "${DEPENDENCIES[@]}"; do
+        if ! command -v "$cmd" &>/dev/null; then
+            MISSING_DEPS+=("$cmd")
+        fi
+    done
+
+    # Verificación especial para PHP
+    if ! command -v php &>/dev/null; then
+        MISSING_DEPS+=("php")
+    fi
+
+    if [ "${#MISSING_DEPS[@]}" -gt 0 ]; then
+        echo -e "${YELLOW}Instalando dependencias faltantes: ${MISSING_DEPS[*]}${RESET}"
+        
+        # Configuración para evitar mensajes interactivos
+        export DEBIAN_FRONTEND=noninteractive
+        
+        # Actualizar lista de paquetes
+        apt-get -qq update || error_exit "Falló al actualizar la lista de paquetes"
+
+        # Instalar paquetes
+        apt-get -qq -y install "${MISSING_DEPS[@]}" || error_exit "Falló al instalar dependencias"
+        
+        PKG_INSTALLED=1
+    fi
+
+    # Verificación final de PHP
+    if ! command -v php &>/dev/null; then
+        error_exit "PHP no se instaló correctamente"
+    fi
+
+    if [ "$PKG_INSTALLED" -eq 1 ]; then
+        echo -e "${GREEN}Dependencias instaladas correctamente.${RESET}"
+    else
+        echo -e "${GREEN}Todas las dependencias están instaladas.${RESET}"
+    fi
+}
+
+## Verificar si se ejecuta como root
+if [ "$EUID" -ne 0 ]; then
+    error_exit "Este script debe ejecutarse como root."
+fi
+
+## Detección de sistema operativo
+OS=$(grep '^ID=' /etc/os-release | cut -d= -f2 | tr -d '"')
+
+if [[ "$OS" != "ubuntu" && "$OS" != "debian" ]]; then
+    error_exit "Este script está diseñado para sistemas basados en Debian/Ubuntu."
+fi
+
+## Verificar e instalar dependencias
+verify_dependencies
+
+## Crear directorios necesarios
+mkdir -p "$BLOQUEO_DIR" "$BLOCKED_DIR" "$LOGOS_DIR" || error_exit "No se pudieron crear los directorios necesarios."
+chown -R www-data:www-data "$BLOQUEO_DIR"
+chown www-data:www-data "$BLOCKED_DIR"
+chmod 755 "$BLOCKED_DIR"
+
+## Descargar lista Magis con verificación
+echo -e "${BLUE}Descargando lista Magis...${RESET}"
+if ! curl -s -o "$MAGIS" "$MAGIS_URL"; then
+    error_exit "Error al descargar lista Magis desde $MAGIS_URL"
+fi
+
+## Verificar existencia de archivos locales
+for file in "$COLJUEGOS" "$MINTIC"; do
+    if [ ! -f "$file" ]; then
+        error_exit "Archivo requerido no encontrado: $file"
+    fi
+done
+
+## Procesar listas de bloqueo
+echo -e "${BLUE}Procesando listas de bloqueo...${RESET}"
+
+## Limpiar archivos temporales previos
+rm -f "$BLOCKED_DOMAINS_ORIGIN" "$BLOCKED_URLS_LIST"
+
+## Función para normalizar URLs
+normalize_url() {
+    local url="$1"
+    # Eliminar protocolo http:// o https://
+    url=${url#http://}
+    url=${url#https://}
+    # Eliminar parámetros de consulta (?) y fragmentos (#)
+    url=${url%%[?#]*}
+    # Eliminar barra final
+    url=${url%/}
+    echo "$url"
+}
+
+## Procesar coljuegos.txt (solo dominios)
+while IFS= read -r linea || [[ -n "$linea" ]]; do
+    dominio=$(normalize_url "$linea")
+    echo "$dominio=coljuegos" >> "$BLOCKED_DOMAINS_ORIGIN"
+    echo "$dominio" >> "$BLOCKED_URLS_LIST"
+done < "$COLJUEGOS"
+
+## Procesar mintic.txt (URLs completas)
+while IFS= read -r linea || [[ -n "$linea" ]]; do
+    url=$(normalize_url "$linea")
+    dominio=$(echo "$url" | awk -F/ '{print $1}')
+    echo "$dominio=mintic" >> "$BLOCKED_DOMAINS_ORIGIN"
+    echo "$url" >> "$BLOCKED_URLS_LIST"
+done < "$MINTIC"
+
+## Procesar magis.txt (URLs completas)
+while IFS= read -r linea || [[ -n "$linea" ]]; do
+    url=$(normalize_url "$linea")
+    dominio=$(echo "$url" | awk -F/ '{print $1}')
+    echo "$dominio=magis" >> "$BLOCKED_DOMAINS_ORIGIN"
+    echo "$url" >> "$BLOCKED_URLS_LIST"
+done < "$MAGIS"
+
+## Eliminar duplicados manteniendo el orden original
+sort -u "$BLOCKED_DOMAINS_ORIGIN" -o "$BLOCKED_DOMAINS_ORIGIN"
+sort -u "$BLOCKED_URLS_LIST" -o "$BLOCKED_URLS_LIST"
+
+## Función para descargar logos desde logos.conf
+process_logos() {
+    echo -e "${BLUE}Procesando logos de empresas...${RESET}"
+    
+    if [ ! -f "$LOGOS_CONF" ]; then
+        echo -e "${YELLOW}Archivo $LOGOS_CONF no encontrado. Se usará logo por defecto.${RESET}"
+        return
+    fi
+
+    # Crear archivo de mapeo IP-Logo para Apache
+    IP_LOGO_MAP="$BLOQUEO_DIR/ip_logo_map.txt"
+    rm -f "$IP_LOGO_MAP"
+    
+    while IFS=':' read -r empresa ip logo_url || [[ -n "$empresa" ]]; do
+        # Ignorar líneas vacías o comentarios
+        if [[ -z "$empresa" || "$empresa" =~ ^\s*# ]]; then
+            continue
+        fi
+        
+        # Extraer nombre del archivo del logo
+        logo_file=$(basename "$logo_url")
+        
+        # Descargar logo si no existe
+        if [ ! -f "$LOGOS_DIR/$logo_file" ]; then
+            echo -e "${YELLOW}Descargando logo para $empresa...${RESET}"
+            if ! curl -s -o "$LOGOS_DIR/$logo_file" "$logo_url"; then
+                echo -e "${RED}Error al descargar logo para $empresa desde $logo_url${RESET}"
+                continue
+            fi
+            chown www-data:www-data "$LOGOS_DIR/$logo_file"
+        fi
+        
+        # Agregar al mapeo IP-Logo
+        echo "$ip:$logo_file" >> "$IP_LOGO_MAP"
+        
+    done < "$LOGOS_CONF"
+    
+    if [ -f "$IP_LOGO_MAP" ]; then
+        chown www-data:www-data "$IP_LOGO_MAP"
+    fi
+    
+    echo -e "${GREEN}Logos de empresas procesados correctamente.${RESET}"
+}
+
+## Procesar logos
+process_logos
+
+## Crear logo por defecto si no existe
+if [ ! -f "$LOGOS_DIR/$DEFAULT_LOGO" ]; then
+    echo -e "${YELLOW}Creando logo por defecto...${RESET}"
+    convert -size 300x100 xc:white -gravity center -pointsize 20 -fill black -draw "text 0,0 'LOGO POR DEFECTO'" "$LOGOS_DIR/$DEFAULT_LOGO" || \
+    echo "Logo por defecto" > "$LOGOS_DIR/$DEFAULT_LOGO"
+    chown www-data:www-data "$LOGOS_DIR/$DEFAULT_LOGO"
+fi
+
+## Crear HTML de bloqueo dinámico con detección mejorada de IP
+echo -e "${BLUE}Creando página de bloqueo con detección de IPv4/IPv6...${RESET}"
+cat <<'EOF' > "$BLOQUEO_HTML"
+<?php
+// Mostrar errores (puedes quitar esto en producción)
+error_reporting(E_ALL);
+ini_set('display_errors', 1);
+
+// Función para obtener la IP real del cliente considerando proxies
+function getClientIP() {
+    $ip_keys = [
+        'HTTP_CLIENT_IP',
+        'HTTP_X_FORWARDED_FOR',
+        'HTTP_X_FORWARDED',
+        'HTTP_X_CLUSTER_CLIENT_IP',
+        'HTTP_FORWARDED_FOR',
+        'HTTP_FORWARDED',
+        'HTTP_CF_CONNECTING_IP', // Cloudflare
+        'HTTP_X_REAL_IP',        // Nginx
+        'REMOTE_ADDR'
+    ];
+    
+    $ipv4 = '';
+    $ipv6 = '';
+    
+    foreach ($ip_keys as $key) {
+        if (!empty($_SERVER[$key])) {
+            $ips = explode(',', $_SERVER[$key]);
+            foreach ($ips as $ip) {
+                $ip = trim($ip);
+                
+                // Validar IPv4
+                if (empty($ipv4) && filter_var($ip, FILTER_VALIDATE_IP, FILTER_FLAG_IPV4 | FILTER_FLAG_NO_PRIV_RANGE | FILTER_FLAG_NO_RES_RANGE)) {
+                    $ipv4 = $ip;
+                }
+                
+                // Validar IPv6
+                if (empty($ipv6) && filter_var($ip, FILTER_VALIDATE_IP, FILTER_FLAG_IPV6)) {
+                    $ipv6 = $ip;
+                }
+            }
+        }
+    }
+    
+    // Si no se encontró IPv4 válida, usar REMOTE_ADDR
+    if (empty($ipv4) && !empty($_SERVER['REMOTE_ADDR']) && filter_var($_SERVER['REMOTE_ADDR'], FILTER_VALIDATE_IP, FILTER_FLAG_IPV4)) {
+        $ipv4 = $_SERVER['REMOTE_ADDR'];
+    }
+    
+    // Si no se encontró IPv6 válida, usar REMOTE_ADDR si es IPv6
+    if (empty($ipv6) && !empty($_SERVER['REMOTE_ADDR']) && filter_var($_SERVER['REMOTE_ADDR'], FILTER_VALIDATE_IP, FILTER_FLAG_IPV6)) {
+        $ipv6 = $_SERVER['REMOTE_ADDR'];
+    }
+    
+    return [
+        'ipv4' => $ipv4 ?: 'No detectada',
+        'ipv6' => $ipv6 ?: 'No detectada'
+    ];
+}
+
+// Obtener IPs del cliente
+$client_ips = getClientIP();
+
+// Variables adicionales
+$host = $_SERVER['HTTP_HOST'] ?? '';
+$uri = $_SERVER['REQUEST_URI'] ?? '';
+$scheme = (!empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off') ? 'https' : 'http';
+$url_visitada = $scheme . "://" . $host . $uri;
+
+// Variables de logo
+$logo_path = "/etc/apache2/blocked_lists/logos.conf";
+$logo_file = "logos/default.png"; // Default logo
+$logos_dir = "logos";
+
+// Procesar logos.conf si existe
+if (file_exists($logo_path) && is_readable($logo_path)) {
+    $lines = file($logo_path, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES);
+    if ($lines !== false) {
+        foreach ($lines as $line) {
+            $parts = explode(':', $line, 3);
+            if (count($parts) === 3) {
+                list($empresa, $ip, $url_logo) = $parts;
+                $ip = trim($ip);
+                
+                // Verificar si la IP del cliente coincide con la IP del logo
+                if (($ip === $client_ips['ipv4'] || $ip === $client_ips['ipv6']) && filter_var($url_logo, FILTER_VALIDATE_URL)) {
+                    $nombre_archivo = strtolower(preg_replace('/[^a-zA-Z0-9]/', '', $empresa)) . '.png';
+                    $logo_local_path = "$logos_dir/$nombre_archivo";
+                    
+                    if (!is_dir($logos_dir)) {
+                        mkdir($logos_dir, 0755, true);
+                    }
+                    
+                    // Descargar logo si no existe o está desactualizado
+                    if (!file_exists($logo_local_path) || (time() - filemtime($logo_local_path) > 86400)) {
+                        $contenido_logo = @file_get_contents($url_logo);
+                        if ($contenido_logo !== false) {
+                            file_put_contents($logo_local_path, $contenido_logo);
+                        }
+                    }
+                    
+                    if (file_exists($logo_local_path) && getimagesize($logo_local_path) !== false) {
+                        $logo_file = $logo_local_path;
+                    }
+                    break;
+                }
+            }
+        }
+    }
+}
+
+// Hora en Colombia
+date_default_timezone_set('America/Bogota');
+$hora_colombia = date('h:i:s A');
+
+// Verificar si la URL está bloqueada
+$requested_url = $host . $uri;
+$blocked_urls = @file('/etc/apache2/blocked_lists/blocked_urls_list.txt', FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES);
+                
+if ($blocked_urls === false) {
+    $blocked_urls = [];
+}
+
+$normalized_request = strtolower(preg_replace('/^https?:\/\/|\/$/', '', $requested_url));
+$is_blocked = false;
+
+foreach ($blocked_urls as $blocked_url) {
+    $normalized_blocked = strtolower(preg_replace('/^https?:\/\/|\/$/', '', $blocked_url));
+    if ($normalized_request === $normalized_blocked) {
+        $is_blocked = true;
+        break;
+    }
+}
+
+if (!$is_blocked) {
+    // Si la URL no está en la lista de bloqueo, redirigir al contenido real
+    header("Location: $scheme://$requested_url", true, 302);
+    exit;
+}
+
+// Determinar el origen del bloqueo
+$domain_origin_file = '/etc/apache2/blocked_lists/blocked_domains_origin.txt';
+$domain_origins = [];
+$block_type = 'unknown';
+
+if (file_exists($domain_origin_file)) {
+    $lines = @file($domain_origin_file, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES);
+    if ($lines !== false) {
+        foreach ($lines as $line) {
+            $parts = explode('=', $line, 2);
+            if (count($parts) === 2) {
+                $domain_origins[strtolower(trim($parts[0]))] = trim($parts[1]);
+            }
+        }
+    }
+}
+
+$dominio = strtolower($host);
+if (isset($domain_origins[$dominio])) {
+    $block_type = $domain_origins[$dominio];
+}
+
+// Función para proteger las salidas
+function h($string) {
+    return htmlspecialchars($string, ENT_QUOTES, 'UTF-8');
+}
+?>
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta http-equiv="X-UA-Compatible" content="IE=edge">
+    <meta name="description" content="Página de acceso restringido ticcol">
+    <meta name="robots" content="noindex, nofollow">
+    <title>Acceso Restringido</title>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+    <style>
+        /* Estilos CSS de la plantilla original */
+        :root {
+            --primary: #1a56db;
+            --primary-light: #3b82f6;
+            --primary-dark: #1e429f;
+            --secondary: #64748b;
+            --accent: #f43f5e;
+            --success: #10b981;
+            --warning: #f59e0b;
+            --error: #ef4444;
+            --gray-100: #f3f4f6;
+            --gray-200: #e5e7eb;
+            --gray-300: #d1d5db;
+            --gray-400: #9ca3af;
+            --gray-500: #6b7280;
+            --gray-600: #4b5563;
+            --gray-700: #374151;
+            --gray-800: #1f2937;
+            --gray-900: #111827;
+        }
+
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: 'Segoe UI', system-ui, -apple-system, BlinkMacSystemFont, Roboto, Oxygen, Ubuntu, sans-serif;
+            background-color: #f8fafc;
+            color: var(--gray-800);
+            line-height: 1.5;
+            padding: 0;
+            margin: 0;
+        }
+
+        .container {
+            max-width: 1000px;
+            margin: 2rem auto;
+            padding: 0 1rem;
+        }
+
+        .header {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            margin-bottom: 2rem;
+            text-align: center;
+            animation: fadeIn 0.8s ease-in-out;
+            position: relative;
+        }
+
+        #logo {
+            max-width: 220px;
+            height: auto;
+            margin-bottom: 1.5rem;
+            border-radius: 8px;
+            box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
+            transition: transform 0.3s ease;
+        }
+
+        #logo:hover {
+            transform: scale(1.05);
+        }
+
+        .time-badge {
+            position: absolute;
+            top: 0;
+            right: 0;
+            background-color: var(--primary);
+            color: white;
+            padding: 0.5rem 1rem;
+            border-radius: 0.5rem;
+            font-size: 1rem;
+            font-weight: 500;
+            box-shadow: 0 2px 4px rgba(0, 0, 0, 0.1);
+            animation: slideIn 0.5s ease-out;
+        }
+
+        #titulo {
+            color: var(--primary);
+            font-size: 2.5rem;
+            font-weight: 700;
+            margin-bottom: 1rem;
+            position: relative;
+            padding-bottom: 0.5rem;
+        }
+
+        #titulo::after {
+            content: '';
+            position: absolute;
+            bottom: 0;
+            left: 50%;
+            transform: translateX(-50%);
+            width: 80px;
+            height: 4px;
+            background-color: var(--accent);
+            border-radius: 2px;
+        }
+
+        .alert-box {
+            background-color: #fff;
+            border-radius: 12px;
+            padding: 2rem;
+            margin-bottom: 2rem;
+            box-shadow: 0 4px 20px rgba(0, 0, 0, 0.08);
+            border-left: 5px solid var(--accent);
+            animation: slideIn 0.5s ease-out;
+        }
+
+        .url-container {
+            display: flex;
+            align-items: flex-start;
+            margin-bottom: 1rem;
+        }
+
+        .url-icon {
+            background-color: var(--accent);
+            color: white;
+            width: 40px;
+            height: 40px;
+            border-radius: 50%;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            margin-right: 1rem;
+            flex-shrink: 0;
+        }
+
+        #mensaje {
+            font-size: 1.2rem;
+            color: var(--gray-700);
+        }
+
+        .url-visitada {
+            font-weight: bold;
+            color: var(--accent);
+            word-break: break-all;
+            display: inline-block;
+            margin-top: 0.5rem;
+            padding: 0.25rem 0.5rem;
+            background-color: #fff0f3;
+            border-radius: 4px;
+        }
+
+        .info-cards {
+            display: grid;
+            grid-template-columns: 1fr;
+            gap: 1.5rem;
+            margin-bottom: 2rem;
+        }
+
+        @media (min-width: 768px) {
+            .info-cards {
+                grid-template-columns: repeat(2, 1fr);
+            }
+        }
+
+        @media (min-width: 1024px) {
+            .info-cards {
+                grid-template-columns: repeat(3, 1fr);
+            }
+        }
+
+        .card {
+            background-color: white;
+            border-radius: 12px;
+            padding: 1.5rem;
+            box-shadow: 0 4px 6px rgba(0, 0, 0, 0.05);
+            border-top: 5px solid var(--primary);
+            transition: transform 0.3s ease, box-shadow 0.3s ease;
+            opacity: 0;
+        }
+
+        .card:hover {
+            transform: translateY(-5px);
+            box-shadow: 0 10px 15px rgba(0, 0, 0, 0.1);
+        }
+
+        .card-1 {
+            border-top-color: var(--primary);
+        }
+
+        .card-2 {
+            border-top-color: var(--warning);
+        }
+
+        .card-3 {
+            border-top-color: var(--error);
+        }
+
+        .card-icon {
+            width: 50px;
+            height: 50px;
+            border-radius: 50%;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            margin-bottom: 1rem;
+            font-size: 1.5rem;
+        }
+
+        .card-1 .card-icon {
+            background-color: #e0edff;
+            color: var(--primary);
+        }
+
+        .card-2 .card-icon {
+            background-color: #fff8e6;
+            color: var(--warning);
+        }
+
+        .card-3 .card-icon {
+            background-color: #fee2e2;
+            color: var(--error);
+        }
+
+        .card h3 {
+            font-size: 1.25rem;
+            color: var(--gray-800);
+            margin-bottom: 1rem;
+            display: flex;
+            align-items: center;
+        }
+
+        .card p {
+            color: var(--gray-600);
+            margin-bottom: 1rem;
+            font-size: 0.95rem;
+        }
+
+        .info-section {
+            background-color: white;
+            border-radius: 12px;
+            padding: 2rem;
+            margin-bottom: 2rem;
+            box-shadow: 0 4px 6px rgba(0, 0, 0, 0.05);
+        }
+
+        .info-section h2 {
+            font-size: 1.75rem;
+            color: var(--primary);
+            margin-bottom: 1.5rem;
+            padding-bottom: 0.5rem;
+            border-bottom: 2px solid var(--gray-200);
+        }
+
+        .info-section h4 {
+            font-size: 1.2rem;
+            color: var(--gray-700);
+            margin: 1.5rem 0 0.75rem 0;
+        }
+
+        .info-section ul {
+            padding-left: 1.5rem;
+            margin-bottom: 1.5rem;
+        }
+
+        .info-section li {
+            margin-bottom: 0.5rem;
+            color: var(--gray-700);
+        }
+
+        .contact-card {
+            background-color: #f8f9fa;
+            border-radius: 8px;
+            padding: 1rem;
+            margin-top: 1rem;
+            border-left: 4px solid var(--primary);
+        }
+
+        .contact-card p {
+            margin: 0.5rem 0;
+        }
+
+        .contact-card a {
+            color: var(--primary);
+            text-decoration: none;
+            font-weight: 500;
+            transition: color 0.2s;
+        }
+
+        .contact-card a:hover {
+            color: var(--primary-dark);
+            text-decoration: underline;
+        }
+
+        footer {
+            background-color: white;
+            border-radius: 12px;
+            padding: 2rem;
+            box-shadow: 0 4px 6px rgba(0, 0, 0, 0.05);
+            text-align: center;
+        }
+
+        footer h4 {
+            color: var(--primary);
+            font-size: 1.25rem;
+            margin-bottom: 1rem;
+        }
+
+        footer p {
+            color: var(--gray-600);
+            margin: 0.5rem 0;
+        }
+
+        footer a {
+            color: var(--primary);
+            text-decoration: none;
+            font-weight: 500;
+            transition: color 0.2s;
+            display: inline-flex;
+            align-items: center;
+            gap: 0.5rem;
+        }
+
+        footer a:hover {
+            color: var(--primary-dark);
+            text-decoration: underline;
+        }
+
+        .copyright {
+            margin-top: 2rem;
+            padding-top: 1rem;
+            border-top: 1px solid var(--gray-200);
+            font-size: 0.9rem;
+            color: var(--gray-500);
+        }
+
+        .ip-info {
+            background-color: var(--gray-100);
+            border-radius: 8px;
+            padding: 1rem;
+            margin-top: 1rem;
+            font-family: monospace;
+            font-size: 0.9rem;
+        }
+
+        .ip-info p {
+            margin: 0.5rem 0;
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+        }
+
+        .ip-info .label {
+            color: var(--gray-600);
+            min-width: 60px;
+        }
+
+        .ip-info .value {
+            color: var(--gray-800);
+            background-color: white;
+            padding: 0.25rem 0.5rem;
+            border-radius: 4px;
+            border: 1px solid var(--gray-200);
+        }
+
+        @keyframes fadeIn {
+            from { opacity: 0; }
+            to { opacity: 1; }
+        }
+
+        @keyframes slideIn {
+            from {
+                transform: translateY(20px);
+                opacity: 0;
+            }
+            to {
+                transform: translateY(0);
+                opacity: 1;
+            }
+        }
+
+        @media (max-width: 768px) {
+            .container {
+                margin: 1rem auto;
+            }
+
+            #titulo {
+                font-size: 1.8rem;
+            }
+
+            .alert-box {
+                padding: 1.5rem;
+            }
+
+            .card {
+                padding: 1.25rem;
+            }
+
+            .time-badge {
+                position: static;
+                margin-top: 0.5rem;
+                display: inline-block;
+            }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <header class="header">
+            <img id="logo" src="<?php echo h($logo_file); ?>" alt="Logo" loading="lazy">
+            <div class="time-badge">
+                <i class="fas fa-clock"></i> <?php echo h($hora_colombia); ?>
+            </div>
+            <h1 id="titulo">Acceso Restringido</h1>
+        </header>
+
+        <div class="alert-box">
+            <div class="url-container">
+                <div class="url-icon">
+                    <i class="fas fa-exclamation-triangle"></i>
+                </div>
+                <div>
+                    <p id="mensaje">El sitio que intentas visitar se encuentra bloqueado conforme a la normativa vigente:</p>
+                    <span class="url-visitada"><?php echo h($url_visitada); ?></span>
+                </div>
+            </div>
+        </div>
+
+        <div class="info-cards">
+            <div class="card card-1">
+                <div class="card-icon">
+                    <i class="fas fa-desktop"></i>
+                </div>
+                <h3>Distribución de Software Ilegal</h3>
+                <p>Bloqueo por disposición del <strong>Ministerio de las TIC (MINTIC)</strong>, en el marco de la investigación penal relacionada con la distribución no autorizada de aplicaciones.</p>
+            </div>
+
+            <div class="card card-2">
+                <div class="card-icon">
+                    <i class="fas fa-dice"></i>
+                </div>
+                <h3>Juegos de Azar No Autorizados</h3>
+                <p>Bloqueo en cumplimiento de la normativa establecida por <strong>MINTIC y COLJUEGOS</strong> relacionada con la regulación de juegos de azar y apuestas en línea.</p>
+            </div>
+
+            <div class="card card-3">
+                <div class="card-icon">
+                    <i class="fas fa-shield-alt"></i>
+                </div>
+                <h3>Contenido Ilegal</h3>
+                <p>Bloqueo en cumplimiento de la <strong>Ley 679 de 2001</strong>, modificada por la <strong>Ley 1336 de 2009</strong>, para prevenir la explotación sexual de menores.</p>
+            </div>
+        </div>
+
+        <section class="info-section">
+            <h2><i class="fas fa-info-circle"></i> Información del Bloqueo</h2>
+
+            <div class="card-content">
+                <?php if ($block_type === 'magis'): ?>
+                <h4><i class="fas fa-desktop"></i> 1. Bloqueo por Distribución de Software Ilegal (MAGIS)</h4>
+                <p>Este sitio ha sido bloqueado por disposición del <strong>Ministerio de las Tecnologías de la Información y las Comunicaciones (MINTIC)</strong>,
+                en el marco de la investigación penal radicado 110016099382202310001, relacionada con la distribución no autorizada de aplicaciones APK denominadas MAGIS TV y/o FLUJO TV.</p>
+                <p>Para mayor información o para reportar un posible error, contacte a la Fiscalía General de la Nación proporcionando el número de radicado mencionado.</p>
+                <?php elseif ($block_type === 'coljuegos'): ?>
+                <h4><i class="fas fa-dice"></i> 2. Bloqueo por Juegos de Azar (COLJUEGOS)</h4>
+                <p>Este sitio ha sido bloqueado en cumplimiento de la normativa establecida por <strong>MINTIC y COLJUEGOS</strong>
+                relacionada con la regulación de juegos de azar y apuestas en línea.</p>
+                <p>La operación de sitios de apuestas no autorizados constituye una violación a la Ley 643 de 2001 y sus normas complementarias.</p>
+                <?php else: ?>
+                <h4><i class="fas fa-shield-alt"></i> 3. Bloqueo por Contenido Ilegal (MINTIC)</h4>
+                <p>Este sitio ha sido bloqueado en cumplimiento de la <strong>Ley 679 de 2001</strong>, modificada por la
+                <strong>Ley 1336 de 2009</strong>, que establece normas para prevenir y sancionar la explotación sexual comercial
+                de niños, niñas y adolescentes a través de medios digitales.</p>
+                <?php endif; ?>
+            </div>
+
+            <h4><i class="fas fa-question-circle"></i> ¿Por qué estás viendo esta página?</h4>
+            <p>El contenido solicitado ha sido restringido por estar presuntamente relacionado con material ilícito,
+            según determinación judicial.</p>
+
+            <h4><i class="fas fa-exclamation-circle"></i> Información importante:</h4>
+            <ul>
+                <li>La protección de menores es responsabilidad de todos los ciudadanos.</li>
+                <li>Cualquier contenido ilegal debe ser reportado inmediatamente.</li>
+                <li>El acceso a este tipo de contenido constituye un delito penal.</li>
+            </ul>
+
+            <h4><i class="fas fa-phone-alt"></i> Canales de Denuncia:</h4>
+            <div class="contact-card">
+                <p><strong><i class="fas fa-building"></i> Policía Nacional - CAI Virtual:</strong><br>
+                <a href="https://www.policia.gov.co/caivirtual" target="_blank" rel="noopener noreferrer">
+                    <i class="fas fa-external-link-alt"></i>
+                    https://www.policia.gov.co/caivirtual
+                </a><br>
+                <i class="fas fa-phone"></i> Línea gratuita: 01 8000 910 112</p>
+
+                <p><strong><i class="fas fa-balance-scale"></i> Fiscalía General de la Nación:</strong><br>
+                <a href="https://www.fiscalia.gov.co" target="_blank" rel="noopener noreferrer">
+                    <i class="fas fa-external-link-alt"></i>
+                    https://www.fiscalia.gov.co
+                </a></p>
+            </div>
+        </section>
+
+        <footer>
+            <h4><i class="fas fa-flag"></i> ¿Deseas reportar un abuso?</h4>
+            <p>Puedes hacerlo a través del sitio oficial de denuncias tecnológicas de Colombia:</p>
+            <p>
+                <a href="https://teprotejocolombia.org" target="_blank"
+
+Analizando el archivo proporcionado, puedo ver que se trata de un script Bash bastante completo para configurar el bloqueo de dominios en un servidor Apache. El script realiza varias funciones:
+
+    Verifica dependencias necesarias (Apache, curl, certbot, PHP)
+
+    Crea directorios necesarios
+
+    Descarga listas de dominios bloqueados desde diferentes fuentes
+
+    Procesa las listas de dominios para bloquear
+
+    Configura logos personalizados para las páginas de bloqueo
+
+    Genera una página HTML dinámica de bloqueo con detección de IP
+
+El archivo parece estar bien estructurado y documentado. Para trabajar sobre él, lo guardaré con el nombre dominios_bloqueados.sh.
+
+¿Qué cambios específicos necesitas realizar en este script? Por ejemplo, podría ayudarte con:
+
+    Modificar la lógica de bloqueo
+
+    Añadir nuevas fuentes de dominios
+
+    Cambiar el diseño de la página de bloqueo
+
+    Optimizar el código existente
+
+    Añadir nuevas funcionalidades
+
+Por favor, indícame qué modificaciones necesitas y te ayudaré a implementarlas.
+omiti parte del script, te lo entrego de nuevo, esta vez completo:
+
+#!/bin/bash
+
+set -e
+
+## Configuración inicial
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+LOG_FILE="/var/log/dominios_bloqueados.log"
+exec > >(tee -a "$LOG_FILE") 2>&1
+
+## Colores para la salida
+GREEN="\e[32m"
+RED="\e[31m"
+YELLOW="\e[33m"
+BLUE="\e[34m"
+RESET="\e[0m"
+
+## Archivos y directorios
+COLJUEGOS="$SCRIPT_DIR/coljuegos.txt"
+MINTIC="$SCRIPT_DIR/mintic.txt"
+MAGIS_URL="https://raw.githubusercontent.com/viejojavi/dns/refs/heads/main/magis.txt"
+MAGIS="$SCRIPT_DIR/magis.txt"
+SITES_AVAILABLE="/etc/apache2/sites-available"
+SITES_ENABLED="/etc/apache2/sites-enabled"
+BLOQUEO_DIR="/var/www/bloqueo"
+BLOQUEO_HTML="$BLOQUEO_DIR/index.php"
+REPORTE_HTML="$BLOQUEO_DIR/reporte.html"
+LOGOS_CONF="$SCRIPT_DIR/logos.conf"
+BLOCKED_DIR="/etc/apache2/blocked_lists"
+BLOCKED_DOMAINS_ORIGIN="$BLOCKED_DIR/blocked_domains_origin.txt"
+BLOCKED_URLS_LIST="$BLOCKED_DIR/blocked_urls_list.txt"
+DEFAULT_LOGO="logo.png"
+APACHE_CONF="000-blocked-sites.conf"
+LOGOS_DIR="$BLOQUEO_DIR/logos"
+
+## Función para mostrar mensaje de error y salir
+error_exit() {
+    echo -e "${RED}[ERROR] $1${RESET}" >&2
+    exit 1
+}
+
+## Función mejorada para verificar dependencias
+verify_dependencies() {
+    echo -e "${BLUE}Verificando dependencias...${RESET}"
+    
+    local DEPENDENCIES=(apache2 curl certbot)
+    local MISSING_DEPS=()
+    local PKG_INSTALLED=0
+
+    # Verificar comandos básicos
+    for cmd in "${DEPENDENCIES[@]}"; do
+        if ! command -v "$cmd" &>/dev/null; then
+            MISSING_DEPS+=("$cmd")
+        fi
+    done
+
+    # Verificación especial para PHP
+    if ! command -v php &>/dev/null; then
+        MISSING_DEPS+=("php")
+    fi
+
+    if [ "${#MISSING_DEPS[@]}" -gt 0 ]; then
+        echo -e "${YELLOW}Instalando dependencias faltantes: ${MISSING_DEPS[*]}${RESET}"
+        
+        # Configuración para evitar mensajes interactivos
+        export DEBIAN_FRONTEND=noninteractive
+        
+        # Actualizar lista de paquetes
+        apt-get -qq update || error_exit "Falló al actualizar la lista de paquetes"
+
+        # Instalar paquetes
+        apt-get -qq -y install "${MISSING_DEPS[@]}" || error_exit "Falló al instalar dependencias"
+        
+        PKG_INSTALLED=1
+    fi
+
+    # Verificación final de PHP
+    if ! command -v php &>/dev/null; then
+        error_exit "PHP no se instaló correctamente"
+    fi
+
+    if [ "$PKG_INSTALLED" -eq 1 ]; then
+        echo -e "${GREEN}Dependencias instaladas correctamente.${RESET}"
+    else
+        echo -e "${GREEN}Todas las dependencias están instaladas.${RESET}"
+    fi
+}
+
+## Verificar si se ejecuta como root
+if [ "$EUID" -ne 0 ]; then
+    error_exit "Este script debe ejecutarse como root."
+fi
+
+## Detección de sistema operativo
+OS=$(grep '^ID=' /etc/os-release | cut -d= -f2 | tr -d '"')
+
+if [[ "$OS" != "ubuntu" && "$OS" != "debian" ]]; then
+    error_exit "Este script está diseñado para sistemas basados en Debian/Ubuntu."
+fi
+
+## Verificar e instalar dependencias
+verify_dependencies
+
+## Crear directorios necesarios
+mkdir -p "$BLOQUEO_DIR" "$BLOCKED_DIR" "$LOGOS_DIR" || error_exit "No se pudieron crear los directorios necesarios."
+chown -R www-data:www-data "$BLOQUEO_DIR"
+chown www-data:www-data "$BLOCKED_DIR"
+chmod 755 "$BLOCKED_DIR"
+
+## Descargar lista Magis con verificación
+echo -e "${BLUE}Descargando lista Magis...${RESET}"
+if ! curl -s -o "$MAGIS" "$MAGIS_URL"; then
+    error_exit "Error al descargar lista Magis desde $MAGIS_URL"
+fi
+
+## Verificar existencia de archivos locales
+for file in "$COLJUEGOS" "$MINTIC"; do
+    if [ ! -f "$file" ]; then
+        error_exit "Archivo requerido no encontrado: $file"
+    fi
+done
+
+## Procesar listas de bloqueo
+echo -e "${BLUE}Procesando listas de bloqueo...${RESET}"
+
+## Limpiar archivos temporales previos
+rm -f "$BLOCKED_DOMAINS_ORIGIN" "$BLOCKED_URLS_LIST"
+
+## Función para normalizar URLs
+normalize_url() {
+    local url="$1"
+    # Eliminar protocolo http:// o https://
+    url=${url#http://}
+    url=${url#https://}
+    # Eliminar parámetros de consulta (?) y fragmentos (#)
+    url=${url%%[?#]*}
+    # Eliminar barra final
+    url=${url%/}
+    echo "$url"
+}
+
+## Procesar coljuegos.txt (solo dominios)
+while IFS= read -r linea || [[ -n "$linea" ]]; do
+    dominio=$(normalize_url "$linea")
+    echo "$dominio=coljuegos" >> "$BLOCKED_DOMAINS_ORIGIN"
+    echo "$dominio" >> "$BLOCKED_URLS_LIST"
+done < "$COLJUEGOS"
+
+## Procesar mintic.txt (URLs completas)
+while IFS= read -r linea || [[ -n "$linea" ]]; do
+    url=$(normalize_url "$linea")
+    dominio=$(echo "$url" | awk -F/ '{print $1}')
+    echo "$dominio=mintic" >> "$BLOCKED_DOMAINS_ORIGIN"
+    echo "$url" >> "$BLOCKED_URLS_LIST"
+done < "$MINTIC"
+
+## Procesar magis.txt (URLs completas)
+while IFS= read -r linea || [[ -n "$linea" ]]; do
+    url=$(normalize_url "$linea")
+    dominio=$(echo "$url" | awk -F/ '{print $1}')
+    echo "$dominio=magis" >> "$BLOCKED_DOMAINS_ORIGIN"
+    echo "$url" >> "$BLOCKED_URLS_LIST"
+done < "$MAGIS"
+
+## Eliminar duplicados manteniendo el orden original
+sort -u "$BLOCKED_DOMAINS_ORIGIN" -o "$BLOCKED_DOMAINS_ORIGIN"
+sort -u "$BLOCKED_URLS_LIST" -o "$BLOCKED_URLS_LIST"
+
+## Función para descargar logos desde logos.conf
+process_logos() {
+    echo -e "${BLUE}Procesando logos de empresas...${RESET}"
+    
+    if [ ! -f "$LOGOS_CONF" ]; then
+        echo -e "${YELLOW}Archivo $LOGOS_CONF no encontrado. Se usará logo por defecto.${RESET}"
+        return
+    fi
+
+    # Crear archivo de mapeo IP-Logo para Apache
+    IP_LOGO_MAP="$BLOQUEO_DIR/ip_logo_map.txt"
+    rm -f "$IP_LOGO_MAP"
+    
+    while IFS=':' read -r empresa ip logo_url || [[ -n "$empresa" ]]; do
+        # Ignorar líneas vacías o comentarios
+        if [[ -z "$empresa" || "$empresa" =~ ^\s*# ]]; then
+            continue
+        fi
+        
+        # Extraer nombre del archivo del logo
+        logo_file=$(basename "$logo_url")
+        
+        # Descargar logo si no existe
+        if [ ! -f "$LOGOS_DIR/$logo_file" ]; then
+            echo -e "${YELLOW}Descargando logo para $empresa...${RESET}"
+            if ! curl -s -o "$LOGOS_DIR/$logo_file" "$logo_url"; then
+                echo -e "${RED}Error al descargar logo para $empresa desde $logo_url${RESET}"
+                continue
+            fi
+            chown www-data:www-data "$LOGOS_DIR/$logo_file"
+        fi
+        
+        # Agregar al mapeo IP-Logo
+        echo "$ip:$logo_file" >> "$IP_LOGO_MAP"
+        
+    done < "$LOGOS_CONF"
+    
+    if [ -f "$IP_LOGO_MAP" ]; then
+        chown www-data:www-data "$IP_LOGO_MAP"
+    fi
+    
+    echo -e "${GREEN}Logos de empresas procesados correctamente.${RESET}"
+}
+
+## Procesar logos
+process_logos
+
+## Crear logo por defecto si no existe
+if [ ! -f "$LOGOS_DIR/$DEFAULT_LOGO" ]; then
+    echo -e "${YELLOW}Creando logo por defecto...${RESET}"
+    convert -size 300x100 xc:white -gravity center -pointsize 20 -fill black -draw "text 0,0 'LOGO POR DEFECTO'" "$LOGOS_DIR/$DEFAULT_LOGO" || \
+    echo "Logo por defecto" > "$LOGOS_DIR/$DEFAULT_LOGO"
+    chown www-data:www-data "$LOGOS_DIR/$DEFAULT_LOGO"
+fi
+
+## Crear HTML de bloqueo dinámico
+echo -e "${BLUE}Creando página de bloqueo...${RESET}"
+cat <<'EOF' > "$BLOQUEO_HTML"
+<?php
+// Mostrar errores (puedes quitar esto en producción)
+error_reporting(E_ALL);
+ini_set('display_errors', 1);
+
+// Initialize variables
+$client_ip = '';
+$client_ipv6 = '';
+
+// Function to extract IP by version from a list of IPs
+function extractIP($ip_list, $ip_version) {
+    $flag = ($ip_version === 4) ? FILTER_FLAG_IPV4 : FILTER_FLAG_IPV6;
+    $ips = explode(',', $ip_list);
+    foreach ($ips as $ip) {
+        $ip = trim($ip);
+        if (filter_var($ip, FILTER_VALIDATE_IP, $flag)) {
+            return $ip;
+        }
+    }
+    return '';
+}
+
+// Function to get real client IP with improved security
+function getRealClientIP() {
+    $headers = [
+        'HTTP_CF_CONNECTING_IP', // Cloudflare
+        'HTTP_X_REAL_IP',         // Nginx proxy
+        'HTTP_CLIENT_IP',
+        'HTTP_X_FORWARDED_FOR',
+        'HTTP_X_FORWARDED',
+        'HTTP_X_CLUSTER_CLIENT_IP',
+        'HTTP_FORWARDED_FOR',
+        'HTTP_FORWARDED',
+        'REMOTE_ADDR'
+    ];
+
+    foreach ($headers as $header) {
+        if (!empty($_SERVER[$header])) {
+            $ips = explode(',', $_SERVER[$header]);
+            foreach ($ips as $ip) {
+                $ip = trim($ip);
+                if (filter_var($ip, FILTER_VALIDATE_IP, FILTER_FLAG_IPV4 | FILTER_FLAG_NO_PRIV_RANGE | FILTER_FLAG_NO_RES_RANGE)) {
+                    return $ip;
+                }
+            }
+        }
+    }
+    return '0.0.0.0';
+}
+
+// Get client's real IPv4
+$client_ip = getRealClientIP();
+$is_invalid_ip = ($client_ip === '0.0.0.0');
+
+// Get IPv6 from headers if available
+if (isset($_SERVER['HTTP_X_FORWARDED_FOR'])) {
+    $client_ipv6 = extractIP($_SERVER['HTTP_X_FORWARDED_FOR'], 6);
+}
+if (empty($client_ipv6) && filter_var($_SERVER['REMOTE_ADDR'], FILTER_VALIDATE_IP, FILTER_FLAG_IPV6)) {
+    $client_ipv6 = $_SERVER['REMOTE_ADDR'];
+}
+if (empty($client_ipv6)) {
+    $client_ipv6 = '::';
+}
+
+// Variables adicionales
+$host = $_SERVER['HTTP_HOST'] ?? '';
+$uri = $_SERVER['REQUEST_URI'] ?? '';
+$scheme = (!empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off') ? 'https' : 'http';
+$url_visitada = $scheme . "://" . $host . $uri;
+
+// Variables de logo
+$logo_path = "/etc/apache2/blocked_lists/logos.conf";
+$logo_file = "logos/default.png"; // Default logo
+$logos_dir = "logos";
+
+// Procesar logos.conf si existe
+if (file_exists($logo_path) && is_readable($logo_path)) {
+    $lines = file($logo_path, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES);
+    if ($lines !== false) {
+        foreach ($lines as $line) {
+            $parts = explode(':', $line, 3);
+            if (count($parts) === 3) {
+                list($empresa, $ip, $url_logo) = $parts;
+                if (filter_var(trim($ip), FILTER_VALIDATE_IP, FILTER_FLAG_IPV4) && trim($ip) === $client_ip) {
+                    $nombre_archivo = strtolower(preg_replace('/[^a-zA-Z0-9]/', '', $empresa)) . '.png';
+                    $logo_local_path = "$logos_dir/$nombre_archivo";
+                    if (!is_dir($logos_dir)) {
+                        mkdir($logos_dir, 0755, true);
+                    }
+                    if (!file_exists($logo_local_path) || (time() - filemtime($logo_local_path) > 86400)) {
+                        $url_logo_limpia = filter_var(trim($url_logo), FILTER_SANITIZE_URL);
+                        if (filter_var($url_logo_limpia, FILTER_VALIDATE_URL)) {
+                            $contenido_logo = @file_get_contents($url_logo_limpia);
+                            if ($contenido_logo !== false) {
+                                file_put_contents($logo_local_path, $contenido_logo);
+                            }
+                        }
+                    }
+                    if (file_exists($logo_local_path) && getimagesize($logo_local_path) !== false) {
+                        $logo_file = $logo_local_path;
+                    }
+                    break;
+                }
+            }
+        }
+    }
+}
+
+// Hora en Colombia
+date_default_timezone_set('America/Bogota');
+$hora_colombia = date('h:i:s A');
+
+// Función para proteger las salidas
+function h($string) {
+    return htmlspecialchars($string, ENT_QUOTES, 'UTF-8');
+}
+
+// Verificar si la URL está bloqueada
+$requested_url = $host . $uri;
+$blocked_urls = @file('/etc/apache2/blocked_lists/blocked_urls_list.txt', FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES);
+                
+if ($blocked_urls === false) {
+    $blocked_urls = [];
+}
+
+$normalized_request = strtolower(preg_replace('/^https?:\/\/|\/$/', '', $requested_url));
+$is_blocked = false;
+
+foreach ($blocked_urls as $blocked_url) {
+    $normalized_blocked = strtolower(preg_replace('/^https?:\/\/|\/$/', '', $blocked_url));
+    if ($normalized_request === $normalized_blocked) {
+        $is_blocked = true;
+        break;
+    }
+}
+
+if (!$is_blocked) {
+    // Si la URL no está en la lista de bloqueo, redirigir al contenido real
+    header("Location: $scheme://$requested_url", true, 302);
+    exit;
+}
+
+// Determinar el origen del bloqueo
+$domain_origin_file = '/etc/apache2/blocked_lists/blocked_domains_origin.txt';
+$domain_origins = [];
+$block_type = 'unknown';
+
+if (file_exists($domain_origin_file)) {
+    $lines = @file($domain_origin_file, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES);
+    if ($lines !== false) {
+        foreach ($lines as $line) {
+            $parts = explode('=', $line, 2);
+            if (count($parts) === 2) {
+                $domain_origins[strtolower(trim($parts[0]))] = trim($parts[1]);
+            }
+        }
+    }
+}
+
+$dominio = strtolower($host);
+if (isset($domain_origins[$dominio])) {
+    $block_type = $domain_origins[$dominio];
+}
+?>
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta http-equiv="X-UA-Compatible" content="IE=edge">
+    <meta name="description" content="Página de acceso restringido ticcol">
+    <meta name="robots" content="noindex, nofollow">
+    <title>Acceso Restringido</title>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css" integrity="sha512-iecdLmaskl7CVkqkXNQ/ZH/XLlvWZOJyj7Yy7tcenmpD1ypASozpmT/E0iPtmFIB46ZmdtAc9eNBvH0H/ZpiBw==" crossorigin="anonymous" referrerpolicy="no-referrer">
+    <style>
+        :root {
+            --primary: #1a56db;
+            --primary-light: #3b82f6;
+            --primary-dark: #1e429f;
+            --secondary: #64748b;
+            --accent: #f43f5e;
+            --success: #10b981;
+            --warning: #f59e0b;
+            --error: #ef4444;
+            --gray-100: #f3f4f6;
+            --gray-200: #e5e7eb;
+            --gray-300: #d1d5db;
+            --gray-400: #9ca3af;
+            --gray-500: #6b7280;
+            --gray-600: #4b5563;
+            --gray-700: #374151;
+            --gray-800: #1f2937;
+            --gray-900: #111827;
+        }
+
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: 'Segoe UI', system-ui, -apple-system, BlinkMacSystemFont, Roboto, Oxygen, Ubuntu, sans-serif;
+            background-color: #f8fafc;
+            color: var(--gray-800);
+            line-height: 1.5;
+            padding: 0;
+            margin: 0;
+        }
+
+        .container {
+            max-width: 1000px;
+            margin: 2rem auto;
+            padding: 0 1rem;
+        }
+
+        .header {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            margin-bottom: 2rem;
+            text-align: center;
+            animation: fadeIn 0.8s ease-in-out;
+            position: relative;
+        }
+
+        #logo {
+            max-width: 220px;
+            height: auto;
+            margin-bottom: 1.5rem;
+            border-radius: 8px;
+            box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
+            transition: transform 0.3s ease;
+        }
+
+        #logo:hover {
+            transform: scale(1.05);
+        }
+
+        .time-badge {
+            position: absolute;
+            top: 0;
+            right: 0;
+            background-color: var(--primary);
+            color: white;
+            padding: 0.5rem 1rem;
+            border-radius: 0.5rem;
+            font-size: 1rem;
+            font-weight: 500;
+            box-shadow: 0 2px 4px rgba(0, 0, 0, 0.1);
+            animation: slideIn 0.5s ease-out;
+        }
+
+        #titulo {
+            color: var(--primary);
+            font-size: 2.5rem;
+            font-weight: 700;
+            margin-bottom: 1rem;
+            position: relative;
+            padding-bottom: 0.5rem;
+        }
+
+        #titulo::after {
+            content: '';
+            position: absolute;
+            bottom: 0;
+            left: 50%;
+            transform: translateX(-50%);
+            width: 80px;
+            height: 4px;
+            background-color: var(--accent);
+            border-radius: 2px;
+        }
+
+        .alert-box {
+            background-color: #fff;
+            border-radius: 12px;
+            padding: 2rem;
+            margin-bottom: 2rem;
+            box-shadow: 0 4px 20px rgba(0, 0, 0, 0.08);
+            border-left: 5px solid var(--accent);
+            animation: slideIn 0.5s ease-out;
+        }
+
+        .url-container {
+            display: flex;
+            align-items: flex-start;
+            margin-bottom: 1rem;
+        }
+
+        .url-icon {
+            background-color: var(--accent);
+            color: white;
+            width: 40px;
+            height: 40px;
+            border-radius: 50%;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            margin-right: 1rem;
+            flex-shrink: 0;
+        }
+
+        #mensaje {
+            font-size: 1.2rem;
+            color: var(--gray-700);
+        }
+
+        .url-visitada {
+            font-weight: bold;
+            color: var(--accent);
+            word-break: break-all;
+            display: inline-block;
+            margin-top: 0.5rem;
+            padding: 0.25rem 0.5rem;
+            background-color: #fff0f3;
+            border-radius: 4px;
+        }
+
+        .info-cards {
+            display: grid;
+            grid-template-columns: 1fr;
+            gap: 1.5rem;
+            margin-bottom: 2rem;
+        }
+
+        @media (min-width: 768px) {
+            .info-cards {
+                grid-template-columns: repeat(2, 1fr);
+            }
+        }
+
+        @media (min-width: 1024px) {
+            .info-cards {
+                grid-template-columns: repeat(3, 1fr);
+            }
+        }
+
+        .card {
+            background-color: white;
+            border-radius: 12px;
+            padding: 1.5rem;
+            box-shadow: 0 4px 6px rgba(0, 0, 0, 0.05);
+            border-top: 5px solid var(--primary);
+            transition: transform 0.3s ease, box-shadow 0.3s ease;
+            opacity: 0;
+        }
+
+        .card:hover {
+            transform: translateY(-5px);
+            box-shadow: 0 10px 15px rgba(0, 0, 0, 0.1);
+        }
+
+        .card-1 {
+            border-top-color: var(--primary);
+        }
+
+        .card-2 {
+            border-top-color: var(--warning);
+        }
+
+        .card-3 {
+            border-top-color: var(--error);
+        }
+
+        .card-icon {
+            width: 50px;
+            height: 50px;
+            border-radius: 50%;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            margin-bottom: 1rem;
+            font-size: 1.5rem;
+        }
+
+        .card-1 .card-icon {
+            background-color: #e0edff;
+            color: var(--primary);
+        }
+
+        .card-2 .card-icon {
+            background-color: #fff8e6;
+            color: var(--warning);
+        }
+
+        .card-3 .card-icon {
+            background-color: #fee2e2;
+            color: var(--error);
+        }
+
+        .card h3 {
+            font-size: 1.25rem;
+            color: var(--gray-800);
+            margin-bottom: 1rem;
+            display: flex;
+            align-items: center;
+        }
+
+        .card p {
+            color: var(--gray-600);
+            margin-bottom: 1rem;
+            font-size: 0.95rem;
+        }
+
+        .info-section {
+            background-color: white;
+            border-radius: 12px;
+            padding: 2rem;
+            margin-bottom: 2rem;
+            box-shadow: 0 4px 6px rgba(0, 0, 0, 0.05);
+        }
+
+        .info-section h2 {
+            font-size: 1.75rem;
+            color: var(--primary);
+            margin-bottom: 1.5rem;
+            padding-bottom: 0.5rem;
+            border-bottom: 2px solid var(--gray-200);
+        }
+
+        .info-section h4 {
+            font-size: 1.2rem;
+            color: var(--gray-700);
+            margin: 1.5rem 0 0.75rem 0;
+        }
+
+        .info-section ul {
+            padding-left: 1.5rem;
+            margin-bottom: 1.5rem;
+        }
+
+        .info-section li {
+            margin-bottom: 0.5rem;
+            color: var(--gray-700);
+        }
+
+        .contact-card {
+            background-color: #f8f9fa;
+            border-radius: 8px;
+            padding: 1rem;
+            margin-top: 1rem;
+            border-left: 4px solid var(--primary);
+        }
+
+        .contact-card p {
+            margin: 0.5rem 0;
+        }
+
+        .contact-card a {
+            color: var(--primary);
+            text-decoration: none;
+            font-weight: 500;
+            transition: color 0.2s;
+        }
+
+        .contact-card a:hover {
+            color: var(--primary-dark);
+            text-decoration: underline;
+        }
+
+        footer {
+            background-color: white;
+            border-radius: 12px;
+            padding: 2rem;
+            box-shadow: 0 4px 6px rgba(0, 0, 0, 0.05);
+            text-align: center;
+        }
+
+        footer h4 {
+            color: var(--primary);
+            font-size: 1.25rem;
+            margin-bottom: 1rem;
+        }
+
+        footer p {
+            color: var(--gray-600);
+            margin: 0.5rem 0;
+        }
+
+        footer a {
+            color: var(--primary);
+            text-decoration: none;
+            font-weight: 500;
+            transition: color 0.2s;
+            display: inline-flex;
+            align-items: center;
+            gap: 0.5rem;
+        }
+
+        footer a:hover {
+            color: var(--primary-dark);
+            text-decoration: underline;
+        }
+
+        .copyright {
+            margin-top: 2rem;
+            padding-top: 1rem;
+            border-top: 1px solid var(--gray-200);
+            font-size: 0.9rem;
+            color: var(--gray-500);
+        }
+
+        .ip-info {
+            background-color: var(--gray-100);
+            border-radius: 8px;
+            padding: 1rem;
+            margin-top: 1rem;
+            font-family: monospace;
+            font-size: 0.9rem;
+        }
+
+        .ip-info p {
+            margin: 0.5rem 0;
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+        }
+
+        .ip-info .label {
+            color: var(--gray-600);
+            min-width: 60px;
+        }
+
+        .ip-info .value {
+            color: var(--gray-800);
+            background-color: white;
+            padding: 0.25rem 0.5rem;
+            border-radius: 4px;
+            border: 1px solid var(--gray-200);
+        }
+
+        @keyframes fadeIn {
+            from { opacity: 0; }
+            to { opacity: 1; }
+        }
+
+        @keyframes slideIn {
+            from {
+                transform: translateY(20px);
+                opacity: 0;
+            }
+            to {
+                transform: translateY(0);
+                opacity: 1;
+            }
+        }
+
+        @media (max-width: 768px) {
+            .container {
+                margin: 1rem auto;
+            }
+
+            #titulo {
+                font-size: 1.8rem;
+            }
+
+            .alert-box {
+                padding: 1.5rem;
+            }
+
+            .card {
+                padding: 1.25rem;
+            }
+
+            .time-badge {
+                position: static;
+                margin-top: 0.5rem;
+                display: inline-block;
+            }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <header class="header">
+            <img id="logo" src="<?php echo h($logo_file); ?>" alt="Logo" loading="lazy">
+            <div class="time-badge">
+                <i class="fas fa-clock"></i> <?php echo h($hora_colombia); ?>
+            </div>
+            <h1 id="titulo">Acceso Restringido</h1>
+        </header>
+
+        <div class="alert-box">
+            <div class="url-container">
+                <div class="url-icon">
+                    <i class="fas fa-exclamation-triangle"></i>
+                </div>
+                <div>
+                    <p id="mensaje">El sitio que intentas visitar se encuentra bloqueado conforme a la normativa vigente:</p>
+                    <span class="url-visitada"><?php echo h($url_visitada); ?></span>
+                </div>
+            </div>
+        </div>
+
+        <div class="info-cards">
+            <div class="card card-1">
+                <div class="card-icon">
+                    <i class="fas fa-desktop"></i>
+                </div>
+                <h3>Distribución de Software Ilegal</h3>
+                <p>Bloqueo por disposición del <strong>Ministerio de las TIC (MINTIC)</strong>, en el marco de la investigación penal relacionada con la distribución no autorizada de aplicaciones.</p>
+            </div>
+
+            <div class="card card-2">
+                <div class="card-icon">
+                    <i class="fas fa-dice"></i>
+                </div>
+                <h3>Juegos de Azar No Autorizados</h3>
+                <p>Bloqueo en cumplimiento de la normativa establecida por <strong>MINTIC y COLJUEGOS</strong> relacionada con la regulación de juegos de azar y apuestas en línea.</p>
+            </div>
+
+            <div class="card card-3">
+                <div class="card-icon">
+                    <i class="fas fa-shield-alt"></i>
+                </div>
+                <h3>Contenido Ilegal</h3>
+                <p>Bloqueo en cumplimiento de la <strong>Ley 679 de 2001</strong>, modificada por la <strong>Ley 1336 de 2009</strong>, para prevenir la explotación sexual de menores.</p>
+            </div>
+        </div>
+
+        <section class="info-section">
+            <h2><i class="fas fa-info-circle"></i> Información del Bloqueo</h2>
+
+            <div class="card-content">
+                <?php if ($block_type === 'magis'): ?>
+                <h4><i class="fas fa-desktop"></i> 1. Bloqueo por Distribución de Software Ilegal (MAGIS)</h4>
+                <p>Este sitio ha sido bloqueado por disposición del <strong>Ministerio de las Tecnologías de la Información y las Comunicaciones (MINTIC)</strong>,
+                en el marco de la investigación penal radicado 110016099382202310001, relacionada con la distribución no autorizada de aplicaciones APK denominadas MAGIS TV y/o FLUJO TV.</p>
+                <p>Para mayor información o para reportar un posible error, contacte a la Fiscalía General de la Nación proporcionando el número de radicado mencionado.</p>
+                <?php elseif ($block_type === 'coljuegos'): ?>
+                <h4><i class="fas fa-dice"></i> 2. Bloqueo por Juegos de Azar (COLJUEGOS)</h4>
+                <p>Este sitio ha sido bloqueado en cumplimiento de la normativa establecida por <strong>MINTIC y COLJUEGOS</strong>
+                relacionada con la regulación de juegos de azar y apuestas en línea.</p>
+                <p>La operación de sitios de apuestas no autorizados constituye una violación a la Ley 643 de 2001 y sus normas complementarias.</p>
+                <?php else: ?>
+                <h4><i class="fas fa-shield-alt"></i> 3. Bloqueo por Contenido Ilegal (MINTIC)</h4>
+                <p>Este sitio ha sido bloqueado en cumplimiento de la <strong>Ley 679 de 2001</strong>, modificada por la
+                <strong>Ley 1336 de 2009</strong>, que establece normas para prevenir y sancionar la explotación sexual comercial
+                de niños, niñas y adolescentes a través de medios digitales.</p>
+                <?php endif; ?>
+            </div>
+
+            <h4><i class="fas fa-question-circle"></i> ¿Por qué estás viendo esta página?</h4>
+            <p>El contenido solicitado ha sido restringido por estar presuntamente relacionado con material ilícito,
+            según determinación judicial.</p>
+
+            <h4><i class="fas fa-exclamation-circle"></i> Información importante:</h4>
+            <ul>
+                <li>La protección de menores es responsabilidad de todos los ciudadanos.</li>
+                <li>Cualquier contenido ilegal debe ser reportado inmediatamente.</li>
+                <li>El acceso a este tipo de contenido constituye un delito penal.</li>
+            </ul>
+
+            <h4><i class="fas fa-phone-alt"></i> Canales de Denuncia:</h4>
+            <div class="contact-card">
+                <p><strong><i class="fas fa-building"></i> Policía Nacional - CAI Virtual:</strong><br>
+                <a href="https://www.policia.gov.co/caivirtual" target="_blank" rel="noopener noreferrer">
+                    <i class="fas fa-external-link-alt"></i>
+                    https://www.policia.gov.co/caivirtual
+                </a><br>
+                <i class="fas fa-phone"></i> Línea gratuita: 01 8000 910 112</p>
+
+                <p><strong><i class="fas fa-balance-scale"></i> Fiscalía General de la Nación:</strong><br>
+                <a href="https://www.fiscalia.gov.co" target="_blank" rel="noopener noreferrer">
+                    <i class="fas fa-external-link-alt"></i>
+                    https://www.fiscalia.gov.co
+                </a></p>
+            </div>
+        </section>
+
+        <footer>
+            <h4><i class="fas fa-flag"></i> ¿Deseas reportar un abuso?</h4>
+            <p>Puedes hacerlo a través del sitio oficial de denuncias tecnológicas de Colombia:</p>
+            <p>
+                <a href="https://teprotejocolombia.org" target="_blank" rel="noopener noreferrer">
+                    <i class="fas fa-external-link-alt"></i>
+                    teprotejocolombia.org
+                </a>
+            </p>
+            <p><i class="fas fa-phone"></i> Línea gratuita nacional: 01 8000 522 020</p>
+            <p><i class="fas fa-envelope"></i> Correo: contacto@teprotejocolombia.org</p>
+
+            <div class="ip-info">
+                <p>
+                    <span class="label">IPv4:</span>
+                    <span class="value"><?php echo h($client_ip); ?></span>
+                </p>
+                <?php if (!empty($client_ipv6) && $client_ipv6 !== '::'): ?>
+                <p>
+                    <span class="label">IPv6:</span>
+                    <span class="value"><?php echo h($client_ipv6); ?></span>
+                </p>
+                <?php endif; ?>
+            </div>
+
+            <div class="copyright">
+                <p>© <?php echo date('Y'); ?> Todos los derechos reservados. Sistema creado por Oscar Castillo -
+                    <a href="https://wa.me/573007081170" target="_blank" rel="noopener noreferrer">
+                        <i class="fab fa-whatsapp"></i>
+                        Contactar al desarrollador
+                    </a>
+                </p>
+            </div>
+        </footer>
+    </div>
+    <script>
+        document.addEventListener('DOMContentLoaded', function() {
+            // Animate cards with improved performance
+            const cards = document.querySelectorAll('.card');
+            requestAnimationFrame(() => {
+                cards.forEach((card, index) => {
+                    setTimeout(() => {
+                        card.style.animation = 'slideIn 0.5s ease-out forwards';
+                    }, index * 150);
+                });
+            });
+
+            // Highlight URL with smooth animation
+            const urlSpan = document.querySelector('.url-visitada');
+            if (urlSpan) {
+                setTimeout(() => {
+                    requestAnimationFrame(() => {
+                        urlSpan.style.transition = 'background-color 1s ease';
+                        urlSpan.style.backgroundColor = '#ffe0e3';
+                        setTimeout(() => {
+                            urlSpan.style.backgroundColor = '#fff0f3';
+                        }, 1000);
+                    });
+                }, 1000);
+            }
+        });
+    </script>
+</body>
+</html>
+EOF
+
+# Configurar permisos para la página de bloqueo
+chown -R www-data:www-data "$BLOQUEO_DIR"
+chmod -R 755 "$BLOQUEO_DIR"
+
+## Configurar Apache para el bloqueo
+echo -e "${BLUE}Configurando Apache...${RESET}"
+
+# Verificar si el sitio 000-default está habilitado antes de intentar deshabilitarlo
+if [ -f "$SITES_ENABLED/000-default.conf" ]; then
+    a2dissite 000-default.conf > /dev/null
+fi
+
+# Crear configuración principal de Apache para bloqueo.ticcol.com
+cat <<EOF > "$SITES_AVAILABLE/$APACHE_CONF"
+<VirtualHost *:80>
+    ServerName bloqueo.ticcol.com
+    DocumentRoot $BLOQUEO_DIR
+
+    <Directory "$BLOQUEO_DIR">
+        Options FollowSymLinks
+        AllowOverride All
+        Require all granted
+    </Directory>
+
+    # Configuración para manejar URLs exactas
+    RewriteEngine On
+    
+    # No redirigir las solicitudes a /bloqueo
+    RewriteCond %{REQUEST_URI} ^/bloqueo
+    RewriteRule ^ - [L]
+    
+    # Verificar si la URL está en la lista de bloqueo
+    RewriteMap blocked-domains "txt:$BLOCKED_URLS_LIST"
+    RewriteCond %{HTTP_HOST}%{REQUEST_URI} ^(.+)$
+    RewriteCond \${blocked-domains:%1|NOT_FOUND} !NOT_FOUND
+    RewriteRule ^(.*)$ / [R=302,L]
+</VirtualHost>
+EOF
+
+# Habilitar configuración
+a2ensite "$APACHE_CONF" > /dev/null
+
+# Habilitar módulos necesarios
+a2enmod rewrite > /dev/null
+
+# Verificar sintaxis de Apache antes de recargar
+echo -e "${BLUE}Verificando configuración de Apache...${RESET}"
+if ! apachectl configtest; then
+    error_exit "Error en la configuración de Apache. Verifique los mensajes anteriores."
+fi
+
+# Recargar Apache
+echo -e "${BLUE}Recargando configuración de Apache...${RESET}"
+systemctl reload apache2 || error_exit "Falló al recargar Apache."
+
+## Mostrar resumen final
+echo -e "${GREEN}\nProceso completado exitosamente!${RESET}"
+echo -e "Resumen de bloqueos:"
+echo -e "  - URLs totales bloqueadas: ${GREEN}$count_total${RESET}"
+echo -e "  - Lista Coljuegos: ${GREEN}$count_coljuegos URLs${RESET}"
+echo -e "  - Lista Mintic: ${GREEN}$count_mintic URLs${RESET}"
+echo -e "  - Lista Magis: ${GREEN}$count_magis URLs${RESET}"
+echo -e "\nPuedes ver el reporte completo en:"
+echo -e "  ${BLUE}http://bloqueo.ticcol.com/reporte.html${RESET}"
+echo -e "\nDetalles de ejecución registrados en: ${YELLOW}$LOG_FILE${RESET}"
+
+exit 0
