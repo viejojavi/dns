@@ -14,8 +14,8 @@ echo "Header Listo"
 sleep 5
 
 #Instala Bind
-#apt-get update -y
-#apt-get upgrade -y
+apt-get update -y
+apt-get upgrade -y
 apt install bind9 bind9-utils -y
 sleep 5
 
