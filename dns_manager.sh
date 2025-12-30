@@ -450,3 +450,4 @@ main() {
 }
 
 # Ejecutar
+main
