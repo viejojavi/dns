@@ -1,14 +1,13 @@
 #!/bin/bash
 
 # Configuración de variables
-USUARIO="xxxx" # ¡Recuerda reemplazar con tu usuario real!
-CONTRASENA="xxxxx" # ¡Recuerda reemplazar con tu contraseña real!
-URL_MINTIC="https://bloqueo.ticcol.com/archivos/mintic.txt"
-URL_COLJUEGOS="https://bloqueo.ticcol.com/archivos/coljuegos.txt"
+USUARIO="XXXXXXXXX"
+CONTRASENA="XXXXXXXXX"
+URL_MINTIC="https://archivo.mintic.gov.co/ubpi/620/articles-182605_archivo_txt.txt"
+URL_COLJUEGOS="https://archivo.mintic.gov.co/ubpi/664/articles-180527_archivo_txt.txt"
 ARCHIVO_MINTIC="mintic.txt"
 ARCHIVO_COLJUEGOS="coljuegos.txt"
-ARCHIVO_DOMINIOS="dominios_mintic.txt" # Este parece no usarse en el script actual, ¿quizás un remanente?
-ARCHIVO_PATHS="paths_dominios.txt"
+ARCHIVO_DOMINIOS="dominios_mintic.txt"
 LOG_FILE="/var/log/descarga_dominios.log"
 
 # Función para registrar logs
@@ -19,100 +18,42 @@ log() {
 # Descargar archivos
 descargar_archivos() {
   log "Iniciando descarga de archivos."
-
-  # Descargar ARCHIVO_MINTIC
   wget --user="$USUARIO" --password="$CONTRASENA" "$URL_MINTIC" -O "$ARCHIVO_MINTIC"
   if [ $? -ne 0 ]; then
-    log "ADVERTENCIA: Error al descargar $ARCHIVO_MINTIC. Creando archivo en blanco."
-    touch "$ARCHIVO_MINTIC" # Crea el archivo vacío si la descarga falla
-  else
-    log "Descargado: $ARCHIVO_MINTIC"
-  fi
-
-  # Descargar ARCHIVO_COLJUEGOS
-  wget --user="$USUARIO" --password="$CONTRASENA" "$URL_COLJUEGOS" -O "$ARCHIVO_COLJUEGOS"
-  if [ $? -ne 0 ]; then
-    log "ADVERTENCIA: Error al descargar $ARCHIVO_COLJUEGOS. Creando archivo en blanco."
-    touch "$ARCHIVO_COLJUEGOS" # Crea el archivo vacío si la descarga falla
-  else
-    log "Descargado: $ARCHIVO_COLJUEGOS"
-  fi
-
-  log "Proceso de descarga de archivos finalizado."
-  return 0 # Siempre devuelve 0 para que el resto del script pueda continuar
-}
-
-# Extraer dominios y paths de mintic.txt
-extraer_dominios_paths() {
-  log "Iniciando extracción de dominios y paths de $ARCHIVO_MINTIC."
-  
-  # Verificar si el archivo MINTIC está vacío antes de procesar
-  if [ ! -s "$ARCHIVO_MINTIC" ]; then
-    log "El archivo $ARCHIVO_MINTIC está vacío o no existe. No se extraerán dominios/paths."
-    # Asegúrate de crear ARCHIVO_PATHS en blanco si no hay datos que procesar
-    touch "$ARCHIVO_PATHS"
-    return 0
-  fi
-
-  declare -A dominios_paths # Diccionario asociativo para dominios y paths
-
-  # Usar un bucle while para leer el archivo línea por línea
-  while IFS= read -r url; do
-    # Eliminar espacios en blanco al principio y al final de la URL
-    url=$(echo "$url" | xargs)
-    
-    # Expresión regular para capturar el dominio y el path
-    # ^(https?:\/\/)? : Coincide con http:// o https:// opcionalmente
-    # ([a-zA-Z0-9.-]+\.[a-zA-Z]{2,}) : Coincide con el dominio (grupo 2)
-    # (.*) : Coincide con el resto de la URL (el path, grupo 3)
-    if [[ "$url" =~ ^(https?:\/\/)?([a-zA-Z0-9.-]+\.[a-zA-Z]{2,})(/.*)? ]]; then
-      dominio="${BASH_REMATCH[2]}"
-      path="${BASH_REMATCH[3]}"
-      
-      if [[ -z "$path" ]]; then
-        path="/" # Si no hay path, establecerlo como "/"
-      fi
-      
-      # Asegúrate de que el path comience con /
-      if [[ ! "$path" =~ ^/ ]]; then
-        path="/$path"
-      fi
-
-      # Si el dominio ya existe, añade el nuevo path en una nueva línea.
-      # Si no, inicializa la entrada del dominio con el path.
-      if [[ -v dominios_paths["$dominio"] ]]; then
-        dominios_paths["$dominio"]+="$path\n"
-      else
-        dominios_paths["$dominio"]="$path\n"
-      fi
-    else
-      log "ADVERTENCIA: URL no válida o no reconocida en $ARCHIVO_MINTIC: $url"
-    fi
-  done < "$ARCHIVO_MINTIC"
-
-  # Escribir dominios y paths en archivo ordenado
-  # Quitar la última nueva línea extra que se añade en el diccionario
-  for dominio in "${!dominios_paths[@]}"; do
-    echo "$dominio:$(echo -e "${dominios_paths[$dominio]}" | sed '$d')" # Elimina el último salto de línea
-  done | sort > "$ARCHIVO_PATHS"
-
-  if [ $? -ne 0 ]; then
-    log "Error al escribir dominios y paths en $ARCHIVO_PATHS."
-    touch "$ARCHIVO_PATHS" # Crea el archivo en blanco si falla la escritura
+    log "Error al descargar $ARCHIVO_MINTIC."
     return 1
   fi
-
-  log "Extracción de dominios y paths completada. Dominios y paths guardados en $ARCHIVO_PATHS."
+  wget --user="$USUARIO" --password="$CONTRASENA" "$URL_COLJUEGOS" -O "$ARCHIVO_COLJUEGOS"
+  if [ $? -ne 0 ]; then
+    log "Error al descargar $ARCHIVO_COLJUEGOS."
+    return 1
+  fi
+  log "Descarga de archivos completada."
   return 0
 }
 
-# --- Ejecución Principal del Script ---
+# Extraer dominios de mintic.txt
+extraer_dominios() {
+  log "Iniciando extracción de dominios de $ARCHIVO_MINTIC."
+  while IFS= read -r url; do
+    if [[ "$url" =~ ^(https?:\/\/)?([a-zA-Z0-9.-]+\.[a-zA-Z]{2,}) ]]; then
+      dominio="${BASH_REMATCH[2]}"
+      echo "$dominio"
+    fi
+  done < "$ARCHIVO_MINTIC" | sort -u > "$ARCHIVO_DOMINIOS"
+  if [ $? -ne 0 ]; then
+    log "Error al extraer dominios."
+    return 1
+  fi
+  log "Extracción de dominios completada. Dominios guardados en $ARCHIVO_DOMINIOS."
+  return 0
+}
 
-# 1. Descargar archivos (siempre intentamos descargar y creamos en blanco si falla)
+# Ejecutar funciones
 descargar_archivos
-
-# 2. Extraer dominios y paths (solo si los archivos base existen, aunque estén en blanco)
-extraer_dominios_paths
+if [ $? -eq 0 ]; then
+  extraer_dominios
+fi
 
 # Fin del script
 log "Script finalizado."
