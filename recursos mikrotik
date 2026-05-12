@@ -1,0 +1,7 @@
+/interface/bridge/add name=loopback
+/ip/address/add address=10.255.255.255 interface=loopback
+/ip/proxy/set enabled=yes port=999
+/ip/proxy/access/add dst-address=10.255.255.255 action=redirect action-data=portal-de-bloqueo-ley-679-de-2001-431043877423.us-west2.run.app
+/ip/proxy/access/add dst-address=fd10:10::255 action=redirect action-data=portal-de-bloqueo-ley-679-de-2001-431043877423.us-west2.run.app
+/ip/firewall/nat/add chain=dstnat dst-address=10.255.255.255 protocol=tcp action=redirect to-ports=999 place-before=0
+/ipv6/firewall/nat/add chain=dstnat dst-address=fd10:10::250 protocol=tcp action=redirect to-ports=999 place-before=0
