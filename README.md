@@ -1,6 +1,6 @@
 Para bloqueo :
 dns
-debes instalar el archivo descarga_mintic.sh y el archivo dns_manager.sh
+debes instalar el archivo descarga_mintic.sh y el archivo install.sh
 
 no olvidar agregar la automatizacion para mantener listado al dia
 
