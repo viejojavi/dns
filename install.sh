@@ -10,8 +10,8 @@ CONFIG_FILES=("magis" "mintic" "coljuegos")
 ZONE_DIR="/etc/bind/zones"
 DATE_SERIAL=$(date +"%y%m%d")
 TEMP_DIR="/tmp/dns_config_$(date +%s)"
-IPV4_ADDRESS="10.255.255.255"
-IPV6_ADDRESS="fd10:10::255"
+IPV4_ADDRESS="172.16.25.22"
+IPV6_ADDRESS="2803:b850:100:5::c"
 
 # Colores y formato
 RED='\033[0;31m'
